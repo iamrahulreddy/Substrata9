@@ -1,0 +1,75 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+
+---
+
+## [Unreleased]
+
+### Added
+- Enhanced test suite with 60+ unit tests covering edge cases and error handling
+- CI/CD documentation with GitHub Actions workflow example
+- Performance guidelines for production vs. diagnostic use
+
+### Changed
+- Improved CRLF handling for cross-platform compatibility
+- Refined documentation with clearer explanations
+
+### Fixed
+- Truncated code block in USAGE.md
+
+---
+
+## [1.1.0] - 2025-12-05
+
+### Added
+- `s9-compare` — Side-by-side comparison of two live processes
+- `--force` flag for non-interactive snapshot deletion
+- Comprehensive JSON output for all tools
+
+### Changed
+- Improved snapshot diff output with detailed resource comparison
+- Enhanced error messages with actionable suggestions
+
+### Fixed
+- Race condition handling when processes exit during inspection
+- Signal mask decoding for edge cases
+
+---
+
+## [1.0.0] - 2024-11-01
+
+Initial public release.
+
+### Core Tools
+
+| Tool | Purpose |
+|------|---------|
+| `s9-inspect` | Deep single-process inspection with memory, FD, and signal analysis |
+| `s9-tree` | Process hierarchy visualization with resource usage |
+| `s9-fdmap` | System-wide file descriptor mapping and leak detection |
+| `s9-snapshot` | Process state capture with temporal comparison |
+| `s9-anomaly` | Automated detection of zombies, resource hogs, and unusual states |
+
+### Features
+- **Zero dependencies** — Pure Bash implementation using only standard Linux utilities
+- **JSON output** — Machine-readable output for automation and integration
+- **Color-coded display** — Terminal-aware formatting with graceful degradation
+- **Safe by design** — Input sanitization, path validation, no `eval` usage
+
+### Documentation
+- Comprehensive usage guide with examples
+- Architecture documentation for contributors
+- JSON schema reference
+- Troubleshooting guide
+
+---
+
+## Version Summary
+
+| Version | Date | Highlights |
+|---------|------|------------|
+| 1.1.0 | 2025-12-05 | Process comparison, test improvements |
+| 1.0.0 | 2024-11-01 | Initial release with 5 core tools |

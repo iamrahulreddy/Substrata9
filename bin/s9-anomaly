@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+#
+# s9-anomaly - Detect unusual process behavior patterns
+# Substrata9
+#
+# Author: Muskula Rahul
+#
+# Requirements: bash 4.0+, Linux with /proc filesystem
+#
+
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+# Run initialization checks
+s9_init
+
+#------------------------------------------------------------------------------
+# Configuration (Thresholds)
+#------------------------------------------------------------------------------
+MEM_THRESHOLD_PERCENT=80
+FD_THRESHOLD=500
+
+# Modes
+CHECK_ZOMBIES=false
+CHECK_HOGS=false
+CHECK_STATES=false
+CHECK_ORPHANS=false
+CHECK_ALL=true
+QUIET_MODE=false
+JSON_MODE=false
+
+#------------------------------------------------------------------------------
+# Detection Functions
+#------------------------------------------------------------------------------
+
+detect_zombies() {
+    if $JSON_MODE; then
+        echo "  \"zombies\": ["
+    else
+        s9_header "ZOMBIE PROCESSES"
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-10s %-20s %s${S9_NC}\n" "PID" "NAME" "PPID" "PARENT" "AGE"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local first=true
+    local uptime_seconds
+    uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+    local hz
+    hz=$(getconf CLK_TCK)
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        
+        [[ -r "$proc_dir/status" ]] || continue
+        
+        local state
+        state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        
+        if [[ "$state" == "Z" ]]; then
+            local name ppid parent_name
+            name=$(s9_get_comm "$pid")
+            ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+            parent_name=$(s9_get_comm "$ppid")
+            
+            # Calculate age
+            local start_time age_str
+            start_time=$(awk '{print $22}' "$proc_dir/stat" 2>/dev/null || echo "0")
+            local age_seconds=$((uptime_seconds - (start_time / hz)))
+            age_str=$(s9_human_duration "$age_seconds")
+            
+            if $JSON_MODE; then
+                if $first; then first=false; else echo ","; fi
+                echo "    {"
+                s9_json_kv "pid" "$pid" "" "    "
+                s9_json_kv "name" "$name" "" "    "
+                s9_json_kv "ppid" "$ppid" "" "    "
+                s9_json_kv "parent_name" "$parent_name" "" "    "
+                s9_json_kv "age" "$age_str" "last" "    "
+                echo -n "    }"
+            else
+                printf "  ${S9_RED}%-8s${S9_NC} %-20s ${S9_YELLOW}%-10s${S9_NC} %-20s ${S9_DIM}%s${S9_NC}\n" \
+                    "$pid" "${name:0:20}" "$ppid" "${parent_name:0:20}" "$age_str"
+            fi
+            
+            ((found++))
+        fi
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+    else
+        echo ""
+        if (( found == 0 )); then
+            printf "  %b✓ No zombie processes found%b\n" "${S9_GREEN}" "${S9_NC}"
+        else
+            printf "  %b! Found %d zombie process(es)%b\n" "${S9_RED}" "$found" "${S9_NC}"
+            echo ""
+            printf "  %bZombies are dead processes waiting for parent to call wait().%b\n" "${S9_DIM}" "${S9_NC}"
+            printf "  %bTo fix: Kill the parent process, or fix the parent's code.%b\n" "${S9_DIM}" "${S9_NC}"
+        fi
+    fi
+}
+
+detect_resource_hogs() {
+    if $JSON_MODE; then
+        echo "  \"hogs\": ["
+    else
+        s9_header "RESOURCE HOGS"
+        printf "  %bThresholds: Memory > %s%% │ FDs > %s%b\n\n" "${S9_DIM}" "$MEM_THRESHOLD_PERCENT" "$FD_THRESHOLD" "${S9_NC}"
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-12s %-8s %-10s %s${S9_NC}\n" "PID" "NAME" "MEMORY" "MEM%" "FDs" "ISSUES"
+        printf "  ${S9_DIM}─────────────────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local total_mem
+    total_mem=$(s9_get_total_mem)
+    
+    local found=0
+    local first=true
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        
+        [[ -r "$proc_dir/status" ]] || continue
+        
+        local name rss
+        name=$(s9_get_comm "$pid")
+        rss=$(awk '/^VmRSS:/ {print $2}' "$proc_dir/status" 2>/dev/null || echo "0")
+        
+        local mem_percent=0
+        if (( rss > 0 )) && (( total_mem > 0 )); then
+            mem_percent=$(echo "scale=1; ($rss * 100) / $total_mem" | bc)
+        fi
+        
+        local fd_count=0
+        if [[ -r "$proc_dir/fd" ]]; then
+            fd_count=$(ls -1 -- "$proc_dir/fd" 2>/dev/null | wc -l)
+        fi
+        
+        local issues=""
+        local is_hog=false
+        
+        # Check thresholds - compare as integers to avoid bc overhead
+        local mem_percent_int=${mem_percent%.*}
+        mem_percent_int=${mem_percent_int:-0}
+        if (( mem_percent_int > MEM_THRESHOLD_PERCENT )); then
+            issues+="HIGH-MEM "
+            is_hog=true
+        fi
+        
+        if (( fd_count > FD_THRESHOLD )); then
+            issues+="HIGH-FDS "
+            is_hog=true
+        fi
+        
+        if $is_hog; then
+            if $JSON_MODE; then
+                if $first; then first=false; else echo ","; fi
+                echo "    {"
+                s9_json_kv "pid" "$pid" "" "    "
+                s9_json_kv "name" "$name" "" "    "
+                s9_json_kv "rss_kb" "$rss" "" "    "
+                s9_json_kv "mem_percent" "$mem_percent" "" "    "
+                s9_json_kv "fd_count" "$fd_count" "" "    "
+                s9_json_kv "issues" "${issues% }" "last" "    "
+                echo -n "    }"
+            else
+                local mem_str
+                mem_str=$(s9_human_kb "$rss")
+                
+                # Color based on severity
+                local mem_color="$S9_YELLOW"
+                if (( $(echo "$mem_percent > 90" | bc -l) )); then
+                    mem_color="$S9_RED"
+                fi
+                
+                local fd_color="$S9_NC"
+                if (( fd_count > FD_THRESHOLD * 2 )); then
+                    fd_color="$S9_RED"
+                elif (( fd_count > FD_THRESHOLD )); then
+                    fd_color="$S9_YELLOW"
+                fi
+                
+                printf "  ${S9_YELLOW}%-8s${S9_NC} %-20s %b%-12s${S9_NC} %b%-8s${S9_NC} %b%-10s${S9_NC} ${S9_RED}%s${S9_NC}\n" \
+                    "$pid" "${name:0:20}" "$mem_color" "$mem_str" "$mem_color" "${mem_percent}%" "$fd_color" "$fd_count" "$issues"
+            fi
+            
+            ((found++))
+        fi
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+    else
+        echo ""
+        if (( found == 0 )); then
+            printf "  %b✓ No resource hogs detected%b\n" "${S9_GREEN}" "${S9_NC}"
+        else
+            printf "  %b! Found %d potential resource hog(s)%b\n" "${S9_YELLOW}" "$found" "${S9_NC}"
+            echo ""
+            printf "  %bUse 's9-inspect <PID>' for detailed analysis%b\n" "${S9_DIM}" "${S9_NC}"
+        fi
+    fi
+}
+
+detect_unusual_states() {
+    if $JSON_MODE; then
+        echo "  \"unusual_states\": ["
+    else
+        s9_header "UNUSUAL STATES"
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-8s %s${S9_NC}\n" "PID" "NAME" "STATE" "DESCRIPTION"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local d_count=0
+    local first=true
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        
+        [[ -r "$proc_dir/status" ]] || continue
+        
+        local state
+        state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        
+        local is_unusual=false
+        local description="" color=""
+        
+        case "$state" in
+            D)
+                is_unusual=true
+                description="Uninterruptible sleep (waiting for I/O)"
+                color="$S9_YELLOW"
+                ((d_count++))
+                ;;
+            T)
+                is_unusual=true
+                description="Stopped (by signal or debugger)"
+                color="$S9_YELLOW"
+                ;;
+            t)
+                is_unusual=true
+                description="Tracing stop (being debugged)"
+                color="$S9_MAGENTA"
+                ;;
+            X)
+                is_unusual=true
+                description="Dead (should not be visible!)"
+                color="$S9_RED"
+                ;;
+        esac
+        
+        if $is_unusual; then
+            local name
+            name=$(s9_get_comm "$pid")
+            
+            if $JSON_MODE; then
+                if $first; then first=false; else echo ","; fi
+                echo "    {"
+                s9_json_kv "pid" "$pid" "" "    "
+                s9_json_kv "name" "$name" "" "    "
+                s9_json_kv "state" "$state" "" "    "
+                s9_json_kv "description" "$description" "last" "    "
+                echo -n "    }"
+            else
+                printf "  %b%-8s${S9_NC} %-20s %b[%s]${S9_NC}     %s\n" \
+                    "$color" "$pid" "${name:0:20}" "$color" "$state" "$description"
+            fi
+            
+            ((found++))
+        fi
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+    else
+        echo ""
+        if (( found == 0 )); then
+            printf "  %b✓ No unusual states detected%b\n" "${S9_GREEN}" "${S9_NC}"
+        else
+            printf "  %b! Found %d process(es) in unusual states%b\n" "${S9_YELLOW}" "$found" "${S9_NC}"
+            
+            if (( d_count > 5 )); then
+                echo ""
+                printf "  %b⚠ Many processes in D state may indicate I/O problems%b\n" "${S9_RED}" "${S9_NC}"
+                printf "  %bCheck: NFS mounts, disk health, storage connectivity%b\n" "${S9_DIM}" "${S9_NC}"
+            fi
+        fi
+    fi
+}
+
+detect_orphans() {
+    if $JSON_MODE; then
+        echo "  \"orphans\": ["
+    else
+        s9_header "ORPHAN PROCESSES"
+        printf "  %bProcesses adopted by init (PPID=1) that aren't system services%b\n\n" "${S9_DIM}" "${S9_NC}"
+        
+        printf "  ${S9_BOLD}%-8s %-25s %-15s %s${S9_NC}\n" "PID" "NAME" "USER" "COMMAND"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local first=true
+    
+    # Known system processes that legitimately have PPID=1
+    local -A system_procs=(
+        ["systemd"]=1 ["init"]=1 ["kthreadd"]=1 ["rcu_gp"]=1 ["rcu_par_gp"]=1
+        ["kworker"]=1 ["migration"]=1 ["cpuhp"]=1 ["netns"]=1 ["kauditd"]=1
+        ["khungtaskd"]=1 ["oom_reaper"]=1 ["writeback"]=1 ["kcompactd"]=1
+        ["ksmd"]=1 ["khugepaged"]=1 ["kintegrityd"]=1 ["kblockd"]=1
+        ["blkcg_punt_bio"]=1 ["tpm_dev_wq"]=1 ["ata_sff"]=1 ["md"]=1
+        ["edac-poller"]=1 ["devfreq_wq"]=1 ["watchdogd"]=1 ["kswapd"]=1
+        ["kthrotld"]=1 ["irq"]=1 ["acpi_thermal_pm"]=1 ["scsi"]=1
+        ["nvme-wq"]=1 ["nvme-reset-wq"]=1 ["nvme-delete-wq"]=1
+        ["dm_bufio_cache"]=1 ["jbd2"]=1 ["ext4"]=1 ["xfs"]=1
+    )
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        
+        # Skip PID 1 itself
+        if [[ "$pid" == "1" ]]; then continue; fi
+        
+        [[ -r "$proc_dir/status" ]] || continue
+        
+        local ppid
+        ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        
+        # Only interested in processes with PPID=1
+        [[ "$ppid" == "1" ]] || continue
+        
+        local name
+        name=$(s9_get_comm "$pid")
+        
+        # Skip known system processes
+        if [[ -n "${system_procs[$name]:-}" ]]; then continue; fi
+        
+        # Skip kernel threads (no cmdline)
+        local cmdline
+        cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
+        if [[ -z "$cmdline" ]]; then continue; fi
+        
+        local uid user
+        uid=$(awk '/^Uid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        user=$(s9_uid_to_user "$uid")
+        
+        if $JSON_MODE; then
+            if $first; then first=false; else echo ","; fi
+            echo "    {"
+            s9_json_kv "pid" "$pid" "" "    "
+            s9_json_kv "name" "$name" "" "    "
+            s9_json_kv "user" "$user" "" "    "
+            s9_json_kv "command" "$cmdline" "last" "    "
+            echo -n "    }"
+        else
+            printf "  ${S9_CYAN}%-8s${S9_NC} %-25s %-15s ${S9_DIM}%s${S9_NC}\n" \
+                "$pid" "${name:0:25}" "${user:0:15}" "${cmdline:0:30}"
+        fi
+        
+        ((found++))
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ]"
+    else
+        echo ""
+        if (( found == 0 )); then
+            printf "  %b✓ No suspicious orphan processes found%b\n" "${S9_GREEN}" "${S9_NC}"
+        else
+            printf "  %b! Found %d orphan process(es)%b\n" "${S9_YELLOW}" "$found" "${S9_NC}"
+            echo ""
+            printf "  %bThese may be legitimate daemons or abandoned processes.%b\n" "${S9_DIM}" "${S9_NC}"
+        fi
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Summary Report
+#------------------------------------------------------------------------------
+
+run_all_checks() {
+    if $JSON_MODE; then
+        echo "{"
+        detect_zombies
+        detect_resource_hogs
+        detect_unusual_states
+        detect_orphans
+        echo "}"
+    else
+        detect_zombies
+        echo ""
+        detect_resource_hogs
+        echo ""
+        detect_unusual_states
+        echo ""
+        detect_orphans
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Main
+#------------------------------------------------------------------------------
+
+usage() {
+    cat << EOF
+${S9_BOLD}s9-anomaly${S9_NC} - Detect unusual process behavior patterns
+Substrata9 v${S9_VERSION}
+
+${S9_BOLD}USAGE:${S9_NC}
+    s9-anomaly [options]
+
+${S9_BOLD}OPTIONS:${S9_NC}
+    --zombies           Check for zombie processes only
+    --hogs              Check for resource hogs only
+    --states            Check for unusual process states only
+    --orphans           Check for orphan processes only
+    --mem-threshold N   Memory threshold percentage (default: 80)
+    --fd-threshold N    FD count threshold (default: 500)
+    -j, --json          Output in JSON format
+    -q, --quiet         Minimal output (for scripting)
+    -h, --help          Show this help
+    -v, --version       Show version
+
+${S9_BOLD}CHECKS PERFORMED:${S9_NC}
+    Zombies     - Dead processes waiting for parent to reap
+    Hogs        - Processes using excessive memory or FDs
+    States      - Processes in D (disk sleep), T (stopped), etc.
+    Orphans     - User processes adopted by init
+
+${S9_BOLD}EXAMPLES:${S9_NC}
+    s9-anomaly                          # Run all checks
+    s9-anomaly --zombies                # Only check for zombies
+    s9-anomaly --hogs --mem-threshold 50
+    s9-anomaly --fd-threshold 100       # Lower FD threshold
+    s9-anomaly --json | jq .            # Output as JSON
+
+EOF
+    exit 0
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --zombies)
+                CHECK_ZOMBIES=true
+                CHECK_ALL=false
+                shift
+                ;;
+            --hogs)
+                CHECK_HOGS=true
+                CHECK_ALL=false
+                shift
+                ;;
+            --states)
+                CHECK_STATES=true
+                CHECK_ALL=false
+                shift
+                ;;
+            --orphans)
+                CHECK_ORPHANS=true
+                CHECK_ALL=false
+                shift
+                ;;
+            --mem-threshold)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Memory threshold must be a number"
+                MEM_THRESHOLD_PERCENT="$2"
+                shift 2
+                ;;
+            --fd-threshold)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "FD threshold must be a number"
+                FD_THRESHOLD="$2"
+                shift 2
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -v|--version)
+                echo "s9-anomaly version $S9_VERSION"
+                exit 0
+                ;;
+            *)
+                s9_die "Unknown option: $1. Use --help for usage."
+                ;;
+        esac
+    done
+    
+    # Quiet mode: count issues only
+    if $QUIET_MODE; then
+        local zombies=0 hogs=0 unusual=0 orphans=0
+        
+        for proc_dir in /proc/[0-9]*; do
+            local pid="${proc_dir##*/}"
+            [[ -r "$proc_dir/status" ]] || continue
+            
+            local state
+            state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+            if [[ "$state" == "Z" ]]; then ((zombies++)); fi
+            if [[ "$state" =~ ^[DTtX]$ ]]; then ((unusual++)); fi
+            
+            local ppid
+            ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+            if [[ "$ppid" == "1" ]] && [[ "$pid" != "1" ]]; then ((orphans++)); fi
+        done
+        
+        echo "ZOMBIES=$zombies UNUSUAL_STATES=$unusual ORPHANS=$orphans"
+        return 0
+    fi
+    
+    if ! $JSON_MODE; then
+        s9_box_title "Substrata9 — Anomaly Detection" "System health scan"
+    fi
+    
+    # Run checks
+    if $CHECK_ALL; then
+        run_all_checks
+    else
+        if $JSON_MODE; then
+            echo "{"
+            local first=true
+            if $CHECK_ZOMBIES; then
+                $first || echo ","
+                detect_zombies
+                first=false
+            fi
+            if $CHECK_HOGS; then
+                $first || echo ","
+                detect_resource_hogs
+                first=false
+            fi
+            if $CHECK_STATES; then
+                $first || echo ","
+                detect_unusual_states
+                first=false
+            fi
+            if $CHECK_ORPHANS; then
+                $first || echo ","
+                detect_orphans
+                first=false
+            fi
+            echo "}"
+        else
+            $CHECK_ZOMBIES && { detect_zombies; echo ""; }
+            $CHECK_HOGS && { detect_resource_hogs; echo ""; }
+            $CHECK_STATES && { detect_unusual_states; echo ""; }
+            $CHECK_ORPHANS && { detect_orphans; echo ""; }
+        fi
+    fi
+    
+    if ! $JSON_MODE; then
+        echo ""
+        s9_rule
+        printf "  %bScan completed at %s │ Substrata9 v%s%b\n" "${S9_DIM}" "$(date '+%Y-%m-%d %H:%M:%S')" "$S9_VERSION" "${S9_NC}"
+        echo ""
+    fi
+}
+
+main "$@"

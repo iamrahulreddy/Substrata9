@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+#
+# s9-tree - Process hierarchy visualization with resource stats
+# Substrata9
+#
+# Author: Muskula Rahul
+#
+# Requirements: bash 4.0+, Linux with /proc filesystem
+#
+
+# Note: Using set -uo pipefail (without -e) to handle race conditions
+# when processes exit during /proc scanning
+
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+# Run initialization checks
+s9_init
+
+#------------------------------------------------------------------------------
+# Configuration
+#------------------------------------------------------------------------------
+ROOT_PID=1
+MAX_DEPTH=100
+FILTER_USER=""
+SHOW_THREADS=false
+SHOW_MEMORY=true
+SHOW_STATE=true
+JSON_MODE=false
+EXPORT_FILE=""
+
+#------------------------------------------------------------------------------
+# Data Collection
+#------------------------------------------------------------------------------
+
+declare -A PROC_NAME
+declare -A PROC_PPID
+declare -A PROC_STATE
+declare -A PROC_RSS
+declare -A PROC_USER
+declare -A PROC_THREADS
+declare -A PROC_CHILDREN
+declare -A PROC_CONTAINER
+
+collect_process_data() {
+    local pid ppid name state rss user threads container
+    
+    for proc_dir in /proc/[0-9]*; do
+        pid="${proc_dir##*/}"
+        
+        # Skip if we can't read it
+        [[ -r "$proc_dir/status" ]] || continue
+        
+        # Read status file once for efficiency
+        local status_content
+        status_content=$(cat "$proc_dir/status" 2>/dev/null) || continue
+        
+        name=$(s9_sanitize_display "$(echo "$status_content" | awk '/^Name:/ {print $2}')")
+        ppid=$(echo "$status_content" | awk '/^PPid:/ {print $2}')
+        state=$(echo "$status_content" | awk '/^State:/ {print $2}')
+        rss=$(echo "$status_content" | awk '/^VmRSS:/ {print $2}')
+        threads=$(echo "$status_content" | awk '/^Threads:/ {print $2}')
+        
+        # Get UID and convert to username
+        local uid
+        uid=$(echo "$status_content" | awk '/^Uid:/ {print $2}')
+        user=$(s9_uid_to_user "$uid")
+        
+        # Check container status (only if requested or in JSON mode, as it's expensive)
+        # For tree view, we might want to optimize this
+        if $JSON_MODE; then
+             container=$(s9_check_namespace "$pid")
+        else
+             container="" 
+        fi
+
+        # Store data
+        PROC_NAME[$pid]="$name"
+        PROC_PPID[$pid]="$ppid"
+        PROC_STATE[$pid]="$state"
+        PROC_RSS[$pid]="${rss:-0}"
+        PROC_USER[$pid]="$user"
+        PROC_THREADS[$pid]="${threads:-1}"
+        PROC_CONTAINER[$pid]="$container"
+        
+        # Build children list
+        if [[ -n "$ppid" ]] && [[ "$ppid" != "0" ]]; then
+            PROC_CHILDREN[$ppid]+="$pid "
+        fi
+    done
+}
+
+#------------------------------------------------------------------------------
+# Tree Rendering
+#------------------------------------------------------------------------------
+
+print_process() {
+    local pid=$1
+    local prefix=$2
+    local is_last=$3
+    local depth=$4
+    
+    # Check depth limit
+    if (( depth > MAX_DEPTH )); then return; fi
+    
+    # Filter by user if specified
+    if [[ -n "$FILTER_USER" ]] && [[ "${PROC_USER[$pid]:-}" != "$FILTER_USER" ]]; then
+        # Still recurse to children, they might match
+        local children="${PROC_CHILDREN[$pid]:-}"
+        
+        # Handle empty children properly
+        if [[ -n "$children" ]]; then
+            local child_array
+            read -ra child_array <<< "$children"
+            local count=${#child_array[@]}
+            local i=0
+            
+            for child in "${child_array[@]}"; do
+                [[ -z "$child" ]] && continue
+                ((i++))
+                local child_is_last=$( (( i == count )) && echo true || echo false )
+                print_process "$child" "$prefix" "$child_is_last" $((depth + 1))
+            done
+        fi
+        return
+    fi
+    
+    local name="${PROC_NAME[$pid]:-unknown}"
+    local state="${PROC_STATE[$pid]:-?}"
+    local rss="${PROC_RSS[$pid]:-0}"
+    local user="${PROC_USER[$pid]:-?}"
+    local threads="${PROC_THREADS[$pid]:-1}"
+    
+    # Tree branch characters
+    local branch
+    if [[ "$is_last" == "true" ]]; then
+        branch="└── "
+    else
+        branch="├── "
+    fi
+    
+    # Color based on state
+    local state_color
+    case "$state" in
+        R) state_color="$S9_GREEN" ;;   # Running
+        S) state_color="$S9_CYAN" ;;    # Sleeping
+        D) state_color="$S9_YELLOW" ;;  # Disk sleep (uninterruptible)
+        Z) state_color="$S9_RED" ;;     # Zombie
+        T) state_color="$S9_YELLOW" ;;  # Stopped
+        t) state_color="$S9_MAGENTA" ;; # Tracing
+        *) state_color="$S9_NC" ;;
+    esac
+    
+    # Format memory
+    local mem_str=""
+    if $SHOW_MEMORY && (( rss > 0 )); then
+        if (( rss >= 1048576 )); then
+            mem_str=$(printf "%.1fG" "$(echo "scale=1; $rss/1048576" | bc)")
+        elif (( rss >= 1024 )); then
+            mem_str=$(printf "%.1fM" "$(echo "scale=1; $rss/1024" | bc)")
+        else
+            mem_str="${rss}K"
+        fi
+    fi
+    
+    # Thread indicator
+    local thread_str=""
+    if $SHOW_THREADS && (( threads > 1 )); then
+        thread_str="${S9_DIM}[${threads}t]${S9_NC}"
+    fi
+    
+    # State indicator
+    local state_str=""
+    if $SHOW_STATE; then
+        state_str="${state_color}[$state]${S9_NC} "
+    fi
+    
+    # Print the line using printf %b for colors
+    printf "%s%s%b%b%s%b" "$prefix" "$branch" "$state_str" "${S9_BOLD}" "$name" "${S9_NC}"
+    printf " %b(%d)%b" "${S9_DIM}" "$pid" "${S9_NC}"
+    [[ -n "$mem_str" ]] && printf " %b%s%b" "${S9_BLUE}" "$mem_str" "${S9_NC}"
+    [[ -n "$thread_str" ]] && printf " %b" "$thread_str"
+    printf " %b%s%b\n" "${S9_DIM}" "$user" "${S9_NC}"
+    
+    # Recurse to children
+    local children="${PROC_CHILDREN[$pid]:-}"
+    
+    local new_prefix
+    if [[ "$is_last" == "true" ]]; then
+        new_prefix="${prefix}    "
+    else
+        new_prefix="${prefix}│   "
+    fi
+    
+    # Handle empty children properly
+    if [[ -n "$children" ]]; then
+        local child_array
+        read -ra child_array <<< "$children"
+        local count=${#child_array[@]}
+        local i=0
+        
+        for child in "${child_array[@]}"; do
+            [[ -z "$child" ]] && continue
+            ((i++))
+            local child_is_last=$( (( i == count )) && echo true || echo false )
+            print_process "$child" "$new_prefix" "$child_is_last" $((depth + 1))
+        done
+    fi
+}
+
+#------------------------------------------------------------------------------
+# JSON Output
+#------------------------------------------------------------------------------
+
+print_json_tree() {
+    local pid=$1
+    local depth=$2
+    
+    # Check depth limit
+    if (( depth > MAX_DEPTH )); then return; fi
+    
+    # Filter by user if specified
+    if [[ -n "$FILTER_USER" ]] && [[ "${PROC_USER[$pid]:-}" != "$FILTER_USER" ]]; then
+        # Check children
+        local children="${PROC_CHILDREN[$pid]:-}"
+        if [[ -n "$children" ]]; then
+            local child_array
+            read -ra child_array <<< "$children"
+            for child in "${child_array[@]}"; do
+                [[ -z "$child" ]] && continue
+                print_json_tree "$child" $((depth + 1))
+            done
+        fi
+        return
+    fi
+
+    local name="${PROC_NAME[$pid]:-unknown}"
+    local state="${PROC_STATE[$pid]:-?}"
+    local rss="${PROC_RSS[$pid]:-0}"
+    local user="${PROC_USER[$pid]:-?}"
+    local threads="${PROC_THREADS[$pid]:-1}"
+    local container="${PROC_CONTAINER[$pid]:-}"
+    
+    echo "{"
+    s9_json_kv "pid" "$pid"
+    s9_json_kv "name" "$name"
+    s9_json_kv "state" "$state"
+    s9_json_kv "rss_kb" "$rss"
+    s9_json_kv "user" "$user"
+    s9_json_kv "threads" "$threads"
+    s9_json_kv "container" "$container"
+    
+    printf "  \"children\": [\n"
+    
+    local children="${PROC_CHILDREN[$pid]:-}"
+    if [[ -n "$children" ]]; then
+        local child_array
+        read -ra child_array <<< "$children"
+        local count=${#child_array[@]}
+        local i=0
+        
+        local first_child=true
+        for child in "${child_array[@]}"; do
+            [[ -z "$child" ]] && continue
+            
+            # Capture output to check if it's empty (e.g. due to depth limit or filter)
+            local output
+            output=$(print_json_tree "$child" $((depth + 1)))
+            
+            if [[ -n "$output" ]]; then
+                if $first_child; then
+                    first_child=false
+                else
+                    echo "    ,"
+                fi
+                echo "$output" | sed 's/^/    /'
+            fi
+        done
+    fi
+    
+    echo "  ]"
+    echo "}"
+}
+
+#------------------------------------------------------------------------------
+# Statistics
+#------------------------------------------------------------------------------
+
+print_summary() {
+    local total_procs=${#PROC_NAME[@]}
+    local total_rss=0
+    local running=0 sleeping=0 zombie=0 stopped=0 other=0
+    
+    for pid in "${!PROC_NAME[@]}"; do
+        total_rss=$((total_rss + ${PROC_RSS[$pid]:-0}))
+        
+        case "${PROC_STATE[$pid]:-?}" in
+            R) ((running++)) ;;
+            S|I) ((sleeping++)) ;;
+            Z) ((zombie++)) ;;
+            T|t) ((stopped++)) ;;
+            *) ((other++)) ;;
+        esac
+    done
+    
+    # Convert to human readable
+    local mem_str
+    mem_str=$(s9_human_kb "$total_rss")
+    
+    echo ""
+    s9_rule
+    echo ""
+    printf "  %bSummary%b\n" "${S9_BOLD}" "${S9_NC}"
+    printf "  %b───────%b\n" "${S9_DIM}" "${S9_NC}"
+    printf "  Processes: %b%d%b total  │  " "${S9_BOLD}" "$total_procs" "${S9_NC}"
+    printf "%b%d%b running  │  " "${S9_GREEN}" "$running" "${S9_NC}"
+    printf "%b%d%b sleeping" "${S9_CYAN}" "$sleeping" "${S9_NC}"
+    (( zombie > 0 )) && printf "  │  %b%d zombie%b" "${S9_RED}" "$zombie" "${S9_NC}"
+    (( stopped > 0 )) && printf "  │  %b%d stopped%b" "${S9_YELLOW}" "$stopped" "${S9_NC}"
+    echo ""
+    printf "  Memory:    %b%s%b total RSS\n" "${S9_BOLD}" "$mem_str" "${S9_NC}"
+    echo ""
+}
+
+#------------------------------------------------------------------------------
+# Main
+#------------------------------------------------------------------------------
+
+usage() {
+    printf "%bs9-tree%b - Process hierarchy visualization\n" "$S9_BOLD" "$S9_NC"
+    printf "Substrata9 v%s\n\n" "$S9_VERSION"
+    
+    printf "%bUSAGE:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-tree [options]\n\n"
+    
+    printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    -p, --pid PID       Start tree from specific PID (default: 1)\n"
+    printf "    -u, --user USER     Show only processes owned by USER\n"
+    printf "    -d, --depth N       Maximum tree depth (default: unlimited)\n"
+    printf "    -t, --threads       Show thread count for each process\n"
+    printf "    -j, --json          Output in JSON format\n"
+    printf "    --export FILE       Save tree to FILE (strips colors for text)\n"
+    printf "    --no-memory         Hide memory usage\n"
+    printf "    --no-state          Hide process state indicators\n"
+    printf "    -h, --help          Show this help\n"
+    printf "    -v, --version       Show version\n\n"
+    
+    printf "%bSTATE CODES:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    %b[R]%b Running    %b[S]%b Sleeping    %b[D]%b Disk Sleep\n" "$S9_GREEN" "$S9_NC" "$S9_CYAN" "$S9_NC" "$S9_YELLOW" "$S9_NC"
+    printf "    %b[Z]%b Zombie     %b[T]%b Stopped     %b[t]%b Tracing\n\n" "$S9_RED" "$S9_NC" "$S9_YELLOW" "$S9_NC" "$S9_MAGENTA" "$S9_NC"
+    
+    printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-tree                           # Full system tree from init\n"
+    printf "    s9-tree --pid 1234                # Tree from specific process\n"
+    printf "    s9-tree --user www-data --depth 3 # Filter by user, limit depth\n"
+    printf "    s9-tree --threads                 # Show thread counts\n"
+    printf "    s9-tree --json | jq .             # Output as JSON\n"
+    printf "    s9-tree --pid 1 --export tree.txt # Save tree to file\n"
+    
+    exit 0
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--pid)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "PID must be a number"
+                ROOT_PID="$2"
+                shift 2
+                ;;
+            -u|--user)
+                FILTER_USER="$2"
+                shift 2
+                ;;
+            -d|--depth)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Depth must be a number"
+                MAX_DEPTH="$2"
+                shift 2
+                ;;
+            -t|--threads)
+                SHOW_THREADS=true
+                shift
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            --export)
+                EXPORT_FILE="$2"
+                shift 2
+                ;;
+            --no-memory)
+                SHOW_MEMORY=false
+                shift
+                ;;
+            --no-state)
+                SHOW_STATE=false
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -v|--version)
+                echo "s9-tree version $S9_VERSION"
+                exit 0
+                ;;
+            *)
+                s9_die "Unknown option: $1. Use --help for usage."
+                ;;
+        esac
+    done
+    
+    if ! $JSON_MODE; then
+        s9_box_title "Substrata9 — Process Tree" "Hierarchy visualization"
+        printf "  %bCollecting process data...%b\n\n" "${S9_DIM}" "${S9_NC}"
+    fi
+    
+    # Collect all process data
+    collect_process_data
+    
+    # Print tree starting from root
+    if [[ -n "$EXPORT_FILE" ]]; then
+        local capture_file
+        capture_file=$(mktemp) || s9_die "Cannot create temp file"
+        
+        {
+            if [[ -n "${PROC_NAME[$ROOT_PID]:-}" ]]; then
+                if $JSON_MODE; then
+                    print_json_tree "$ROOT_PID" 0
+                else
+                    print_process "$ROOT_PID" "" "true" 0
+                    print_summary
+                fi
+            else
+                echo "Process $ROOT_PID not found" >&2
+                exit 1
+            fi
+        } | tee "$capture_file"
+        
+        # Process export file
+        if $JSON_MODE; then
+            cp "$capture_file" "$EXPORT_FILE"
+        else
+            # Strip ANSI codes for text report
+            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE"
+        fi
+        
+        rm -f "$capture_file"
+        s9_info "Tree saved to $EXPORT_FILE"
+    else
+        if [[ -n "${PROC_NAME[$ROOT_PID]:-}" ]]; then
+            if $JSON_MODE; then
+                print_json_tree "$ROOT_PID" 0
+            else
+                print_process "$ROOT_PID" "" "true" 0
+                print_summary
+            fi
+        else
+            s9_die "Process $ROOT_PID not found"
+        fi
+    fi
+}
+
+main "$@"

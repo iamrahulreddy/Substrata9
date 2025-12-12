@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# bc - Minimal `bc` fallback for Substrata9
+#
+# This script provides a lightweight fallback for environments where the
+# standard `bc` calculator is not installed. It uses awk for arithmetic.
+#
+# WHAT IS THIS?
+# -------------
+# If the system doesn't have `bc` installed, Substrata9 will automatically
+# use this script instead. It handles the basic math operations used by the
+# toolkit: addition, subtraction, multiplication, division, and comparisons.
+#
+# LIMITATIONS:
+# - Only supports basic arithmetic (no advanced bc features like sqrt, sin, etc.)
+# - Designed specifically for Substrata9's internal calculations
+# - For full bc functionality, install the real bc: sudo apt install bc
+#
+# USAGE:
+# This script is called internally by s9-common.sh when needed.
+# You don't need to call it directly.
+#
+# Author: Muskula Rahul
+#
+
+set -euo pipefail
+
+# Accept and ignore -l option (common with bc usage)
+if [[ "${1:-}" == "-l" ]]; then
+    shift || true
+fi
+
+# Read all stdin
+INPUT=$(cat -)
+
+# Extract scale if present and remove it from expression
+SCALE=""
+if [[ "$INPUT" =~ scale=([0-9]+)";" ]]; then
+    SCALE="${BASH_REMATCH[1]}"
+    # remove the first occurrence of scale=...;
+    INPUT="${INPUT/*scale=${SCALE};/}"
+fi
+
+# Trim whitespace
+INPUT=$(echo "$INPUT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+# If empty, nothing to do
+if [[ -z "$INPUT" ]]; then
+    exit 0
+fi
+
+# Evaluate expression using awk. We embed the expression directly into the awk program.
+# This assumes expressions contain no unmatched single-quotes. The expressions used by
+# the project are numeric and use operators/parentheses, so this should be safe.
+
+if [[ -n "$SCALE" ]]; then
+    awk "BEGIN { res = ($INPUT); printf \"%.*f\n\", ${SCALE}, res }"
+else
+    # Print integer-like values without decimal point when possible to mimic bc behavior
+    awk "BEGIN { res = ($INPUT); if (res == int(res)) print int(res); else print res }"
+fi

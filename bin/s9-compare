@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# s9-compare - Compare two live processes
+# Substrata9
+#
+# Author: Muskula Rahul
+#
+# Usage: s9-compare <PID1> <PID2>
+#
+
+# Note: Using set -uo pipefail (without -e) to handle race conditions
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+# Run initialization checks
+s9_init
+
+#------------------------------------------------------------------------------
+# Main
+#------------------------------------------------------------------------------
+
+usage() {
+    cat << EOF
+${S9_BOLD}s9-compare${S9_NC} - Compare two live processes
+Substrata9 v${S9_VERSION}
+
+${S9_BOLD}USAGE:${S9_NC}
+    s9-compare <PID1> <PID2> [options]
+
+${S9_BOLD}OPTIONS:${S9_NC}
+    -j, --json      Output in JSON format
+    -h, --help      Show this help
+    -v, --version   Show version
+
+${S9_BOLD}DESCRIPTION:${S9_NC}
+    Captures snapshots of two running processes and compares their
+    resource usage (Memory, FDs, Threads, I/O). Useful for comparing
+    worker processes or debugging resource discrepancies.
+
+${S9_BOLD}EXAMPLES:${S9_NC}
+    s9-compare 1234 5678
+    s9-compare \$(pgrep -n nginx) \$(pgrep -o nginx)
+
+EOF
+    exit 0
+}
+
+main() {
+    local pid1=""
+    local pid2=""
+    local json_mode=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--json)
+                json_mode=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -v|--version)
+                echo "s9-compare version $S9_VERSION"
+                exit 0
+                ;;
+            -*)
+                s9_die "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "$pid1" ]]; then
+                    pid1="$1"
+                elif [[ -z "$pid2" ]]; then
+                    pid2="$1"
+                else
+                    s9_die "Too many arguments. Expected 2 PIDs."
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    [[ -n "$pid1" ]] && [[ -n "$pid2" ]] || usage
+    
+    # Resolve PIDs
+    pid1=$(s9_resolve_pid "$pid1") || exit 1
+    pid2=$(s9_resolve_pid "$pid2") || exit 1
+    
+    if [[ "$pid1" == "$pid2" ]]; then
+        s9_warn "Comparing process $pid1 to itself..."
+    fi
+    
+    # Create temp directory for snapshots
+    local temp_dir
+    temp_dir=$(mktemp -d) || s9_die "Cannot create temp directory"
+    
+    # Ensure cleanup on exit
+    trap "rm -rf '$temp_dir'" EXIT
+    
+    # Export S9_SNAPSHOT_DIR to override s9-snapshot location
+    export S9_SNAPSHOT_DIR="$temp_dir"
+    
+    # Capture snapshots
+    if ! $json_mode; then
+        local name1 name2
+        name1=$(s9_get_comm "$pid1")
+        name2=$(s9_get_comm "$pid2")
+        printf "\n%b  Comparing processes...%b\n" "${S9_DIM}" "${S9_NC}"
+        printf "    %bPID %s%b (%s)  vs  %bPID %s%b (%s)\n\n" \
+            "${S9_CYAN}" "$pid1" "${S9_NC}" "$name1" \
+            "${S9_CYAN}" "$pid2" "${S9_NC}" "$name2"
+    fi
+    
+    # We need to call s9-snapshot. Assuming it's in the same dir as this script.
+    local snapshot_tool="$SCRIPT_DIR/s9-snapshot"
+    if [[ ! -x "$snapshot_tool" ]]; then
+        s9_die "Cannot find s9-snapshot tool at $snapshot_tool"
+    fi
+    
+    # Capture PID1
+    local json_flag=""
+    $json_mode && json_flag="--json"
+    
+    "$snapshot_tool" capture "$pid1" --name "proc1" $json_flag >/dev/null
+    
+    # Capture PID2
+    "$snapshot_tool" capture "$pid2" --name "proc2" $json_flag >/dev/null
+    
+    # Diff them
+    "$snapshot_tool" diff "proc1" "proc2" $json_flag
+}
+
+main "$@"

@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+#
+# s9-inspect - Deep process inspection tool
+# Substrata9
+#
+# Author: Muskula Rahul
+#
+# Usage: s9-inspect <PID|process_name> [options]
+#
+# Requirements: bash 4.0+, Linux with /proc filesystem
+#
+
+# Note: Using set -uo pipefail (without -e) to handle race conditions
+# when processes exit during inspection
+
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+# Run initialization checks
+s9_init
+
+#------------------------------------------------------------------------------
+# Configuration
+#------------------------------------------------------------------------------
+SHOW_MEMORY_DETAILS=false
+SHOW_ENV=false
+QUIET_MODE=false
+JSON_MODE=false
+PROC_BASE="/proc"
+EXPORT_FILE=""
+
+#------------------------------------------------------------------------------
+# Inspection Functions
+#------------------------------------------------------------------------------
+
+inspect_basic() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    # Check process still exists
+    [[ -r "$proc_dir/status" ]] || s9_die "Process $pid no longer exists"
+    
+    s9_header "PROCESS IDENTITY"
+    
+    # Read status file once for efficiency
+    local status_content
+    status_content=$(cat "$proc_dir/status" 2>/dev/null) || s9_die "Cannot read process status"
+    
+    # Parse all fields from single read
+    local name state ppid uid threads
+    name=$(s9_sanitize_display "$(echo "$status_content" | grep "^Name:" | awk '{print $2}')")
+    state=$(echo "$status_content" | grep "^State:" | awk '{print $2, $3}')
+    ppid=$(echo "$status_content" | grep "^PPid:" | awk '{print $2}')
+    uid=$(echo "$status_content" | grep "^Uid:" | awk '{print $2}')
+    threads=$(echo "$status_content" | grep "^Threads:" | awk '{print $2}')
+    
+    # Get username from UID
+    local username
+    username=$(s9_uid_to_user "$uid")
+    
+    # Executable path
+    local exe
+    exe=$(readlink "$proc_dir/exe" 2>/dev/null || echo "(permission denied)")
+    
+    # Command line
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "(unavailable)")
+    [[ -z "$cmdline" ]] && cmdline="(kernel thread)"
+    
+    # Current working directory
+    local cwd
+    cwd=$(readlink "$proc_dir/cwd" 2>/dev/null || echo "(permission denied)")
+    
+    # Start time calculation
+    local start_time_ticks uptime_seconds hz start_seconds start_date
+    start_time_ticks=$(awk '{print $22}' "$proc_dir/stat" 2>/dev/null || echo "0")
+    uptime_seconds=$(awk '{print $1}' /proc/uptime)
+    hz=$(getconf CLK_TCK)
+    start_seconds=$(echo "scale=0; $uptime_seconds - ($start_time_ticks / $hz)" | bc)
+    start_date=$(date -d "@$(($(date +%s) - ${start_seconds%.*}))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+    
+    # Process age
+    local age_str
+    age_str=$(s9_human_duration "${start_seconds%.*}")
+    
+    # Parent name
+    local parent_name
+    parent_name=$(s9_get_comm "$ppid")
+    
+    # Namespace/Container check
+    local ns_info
+    ns_info=$(s9_check_namespace "$pid")
+    
+    # State color
+    local state_color="$S9_NC"
+    case "${state%% *}" in
+        R) state_color="$S9_GREEN" ;;
+        S) state_color="$S9_CYAN" ;;
+        D) state_color="$S9_YELLOW" ;;
+        Z) state_color="$S9_RED" ;;
+        T|t) state_color="$S9_YELLOW" ;;
+    esac
+    
+    s9_kv "PID" "$pid"
+    s9_kv "Name" "$name"
+    s9_kv "State" "$state" 15 "$state_color"
+    s9_kv "Parent" "$parent_name (PID $ppid)"
+    s9_kv "User" "$username (UID $uid)"
+    s9_kv "Threads" "$threads"
+    s9_kv "Started" "$start_date ($age_str ago)"
+    
+    if [[ -n "$ns_info" ]]; then
+        s9_kv "Container" "[$ns_info]" 15 "$S9_MAGENTA"
+    fi
+    
+    s9_kv "Executable" "$exe"
+    s9_kv "Working Dir" "$cwd"
+    
+    if (( ${#cmdline} > 60 )); then
+        s9_kv "Command" "${cmdline:0:60}..."
+    else
+        s9_kv "Command" "$cmdline"
+    fi
+}
+
+inspect_memory() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    s9_header "MEMORY"
+    
+    # Read status file once for efficiency (avoid TOCTOU and improve performance)
+    local status_content
+    status_content=$(s9_read_proc_file "$proc_dir/status") || {
+        printf "  %b(Cannot read process status)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    }
+    
+    # Get memory stats from single read
+    local vmsize vmrss vmdata vmstk vmexe vmlib vmpeak vmswap
+    vmsize=$(echo "$status_content" | grep "^VmSize:" | awk '{print $2}')
+    vmrss=$(echo "$status_content" | grep "^VmRSS:" | awk '{print $2}')
+    vmdata=$(echo "$status_content" | grep "^VmData:" | awk '{print $2}')
+    vmstk=$(echo "$status_content" | grep "^VmStk:" | awk '{print $2}')
+    vmexe=$(echo "$status_content" | grep "^VmExe:" | awk '{print $2}')
+    vmlib=$(echo "$status_content" | grep "^VmLib:" | awk '{print $2}')
+    vmpeak=$(echo "$status_content" | grep "^VmPeak:" | awk '{print $2}')
+    vmswap=$(echo "$status_content" | grep "^VmSwap:" | awk '{print $2}')
+    
+    # Default to 0 if empty
+    vmsize=${vmsize:-0}; vmrss=${vmrss:-0}; vmdata=${vmdata:-0}
+    vmstk=${vmstk:-0}; vmexe=${vmexe:-0}; vmlib=${vmlib:-0}
+    vmpeak=${vmpeak:-0}; vmswap=${vmswap:-0}
+    
+    # Handle kernel threads (no memory info)
+    if [[ "$vmsize" == "0" ]] && [[ ! -f "$proc_dir/maps" ]]; then
+        printf "  %b(Kernel thread - no user-space memory)%b\n" "${S9_DIM}" "${S9_NC}"
+        return
+    fi
+    
+    # Calculate percentages
+    local total_mem mem_percent
+    total_mem=$(s9_get_total_mem)
+    mem_percent=$(echo "scale=2; ($vmrss * 100) / $total_mem" | bc)
+    
+    # Memory color based on usage
+    local mem_color="$S9_GREEN"
+    local mem_pct_int=${mem_percent%.*}
+    if (( mem_pct_int > 50 )); then mem_color="$S9_RED"
+    elif (( mem_pct_int > 25 )); then mem_color="$S9_YELLOW"; fi
+    
+    s9_kv "Virtual Size" "$vmsize kB ($(s9_human_kb "$vmsize"))" 18
+    printf "  %b%-18s%b %s kB (%s) — %b%.2f%% of system%b\n" \
+        "${S9_BOLD}" "Resident (RSS):" "${S9_NC}" "$vmrss" "$(s9_human_kb "$vmrss")" "$mem_color" "$mem_percent" "${S9_NC}"
+    s9_kv "Peak Virtual" "$vmpeak kB" 18
+    
+    echo ""
+    printf "  %b%-12s  %-12s  %-12s  %-12s%b\n" "${S9_DIM}" "Data" "Stack" "Code" "Libraries" "${S9_NC}"
+    printf "  %-12s  %-12s  %-12s  %-12s\n" \
+        "$(s9_human_kb "$vmdata")" "$(s9_human_kb "$vmstk")" "$(s9_human_kb "$vmexe")" "$(s9_human_kb "$vmlib")"
+    
+    if (( vmswap > 0 )); then
+        echo ""
+        printf "  %b⚠ Swap:%b %s kB swapped out\n" "${S9_YELLOW}" "${S9_NC}" "$vmswap"
+    fi
+    
+    if $SHOW_MEMORY_DETAILS; then
+        echo ""
+        printf "  %bMemory Regions (from /proc/$pid/maps):%b\n" "${S9_DIM}" "${S9_NC}"
+        printf "  %b─────────────────────────────────────────────────────────────%b\n" "${S9_DIM}" "${S9_NC}"
+        
+        # Parse and display memory map with colors
+        awk -v green="${S9_GREEN}" -v yellow="${S9_YELLOW}" -v dim="${S9_DIM}" -v nc="${S9_NC}" '{
+            addr = $1
+            perms = $2
+            path = $6
+            if (path == "") path = "[anonymous]"
+            
+            # Color based on permissions
+            if (perms ~ /x/) color = green      # Green for executable
+            else if (perms ~ /w/) color = yellow # Yellow for writable
+            else color = dim                     # Dim for read-only
+            
+            printf "  %b%-24s %s  %s%b\n", color, addr, perms, path, nc
+        }' "$proc_dir/maps" 2>/dev/null | head -20
+        
+        local map_count
+        map_count=$(wc -l < "$proc_dir/maps" 2>/dev/null || echo "0")
+        if (( map_count > 20 )); then
+            printf "  %b... and %d more regions%b\n" "${S9_DIM}" "$((map_count - 20))" "${S9_NC}"
+        fi
+    fi
+}
+
+inspect_file_descriptors() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    local fd_dir="$proc_dir/fd"
+    
+    s9_header "FILE DESCRIPTORS"
+    
+    if [[ ! -r "$fd_dir" ]]; then
+        printf "  %b(Permission denied - run as root for full access)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    fi
+    
+    local fd_count
+    fd_count=$(ls -1 -- "$fd_dir" 2>/dev/null | wc -l)
+    
+    printf "  ${S9_BOLD}Open FDs:${S9_NC} %d\n\n" "$fd_count"
+    
+    # Categorize file descriptors
+    local files=0 sockets=0 pipes=0 devices=0 other=0
+    
+    printf "  %bFD   Type      Target%b\n" "${S9_DIM}" "${S9_NC}"
+    printf "  %b───  ────────  ──────────────────────────────────────────%b\n" "${S9_DIM}" "${S9_NC}"
+    
+    for fd in $(ls -- "$fd_dir" 2>/dev/null | sort -n | head -30); do
+        local target
+        target=$(readlink "$fd_dir/$fd" 2>/dev/null || echo "(unreadable)")
+        
+        local fd_type color
+        case "$target" in
+            socket:*)
+                fd_type="socket"
+                color="$S9_CYAN"
+                ((sockets++))
+                ;;
+            pipe:*)
+                fd_type="pipe"
+                color="$S9_YELLOW"
+                ((pipes++))
+                ;;
+            /dev/*)
+                fd_type="device"
+                color="$S9_BLUE"
+                ((devices++))
+                ;;
+            anon_inode:*)
+                fd_type="anon"
+                color="$S9_DIM"
+                ((other++))
+                ;;
+            *)
+                fd_type="file"
+                color="$S9_GREEN"
+                ((files++))
+                ;;
+        esac
+        
+        printf "  ${S9_BOLD}%-3s${S9_NC}  %b%-8s${S9_NC}  %s\n" "$fd" "$color" "$fd_type" "${target:0:50}"
+    done
+    
+    if (( fd_count > 30 )); then
+        printf "  %b... and %d more%b\n" "${S9_DIM}" "$((fd_count - 30))" "${S9_NC}"
+    fi
+    
+    echo ""
+    printf "  %bSummary: %d files, %d sockets, %d pipes, %d devices, %d other%b\n" \
+        "${S9_DIM}" "$files" "$sockets" "$pipes" "$devices" "$other" "${S9_NC}"
+}
+
+inspect_signals() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    s9_header "SIGNALS"
+    
+    # Read status file once
+    local status_content
+    status_content=$(s9_read_proc_file "$proc_dir/status") || {
+        printf "  %b(Cannot read process status)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    }
+    
+    local sigblk sigign sigcgt sigpnd
+    sigblk=$(echo "$status_content" | grep "^SigBlk:" | awk '{print $2}')
+    sigign=$(echo "$status_content" | grep "^SigIgn:" | awk '{print $2}')
+    sigcgt=$(echo "$status_content" | grep "^SigCgt:" | awk '{print $2}')
+    sigpnd=$(echo "$status_content" | grep "^SigPnd:" | awk '{print $2}')
+    sigblk=${sigblk:-0}; sigign=${sigign:-0}; sigcgt=${sigcgt:-0}; sigpnd=${sigpnd:-0}
+    
+    printf "  ${S9_BOLD}%-12s${S9_NC} %s\n" "Blocked:" "$(s9_decode_signals "$sigblk")"
+    printf "  ${S9_BOLD}%-12s${S9_NC} %s\n" "Ignored:" "$(s9_decode_signals "$sigign")"
+    printf "  ${S9_BOLD}%-12s${S9_NC} %s\n" "Caught:" "$(s9_decode_signals "$sigcgt")"
+    printf "  ${S9_BOLD}%-12s${S9_NC} %s\n" "Pending:" "$(s9_decode_signals "$sigpnd")"
+}
+
+inspect_limits() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    s9_header "RESOURCE LIMITS"
+    
+    if [[ ! -r "$proc_dir/limits" ]]; then
+        printf "  %b(Permission denied)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    fi
+    
+    printf "  %bLimit                     Soft Limit           Hard Limit%b\n" "${S9_DIM}" "${S9_NC}"
+    printf "  ${S9_DIM}────────────────────────  ───────────────────  ───────────────────${S9_NC}\n"
+    
+    grep -E "^(Max open files|Max processes|Max stack size|Max resident set|Max address space)" "$proc_dir/limits" | \
+    while read -r line; do
+        local name soft hard
+        name=$(echo "$line" | sed 's/  */ /g' | cut -d' ' -f1-3)
+        soft=$(echo "$line" | awk '{print $(NF-2)}')
+        hard=$(echo "$line" | awk '{print $(NF-1)}')
+        printf "  %-24s  %-19s  %-19s\n" "$name" "$soft" "$hard"
+    done
+}
+
+inspect_io() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    s9_header "I/O STATISTICS"
+    
+    if [[ ! -r "$proc_dir/io" ]]; then
+        printf "  %b(Permission denied - run as root)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    fi
+    
+    # Read io file once
+    local io_content
+    io_content=$(s9_read_proc_file "$proc_dir/io") || {
+        printf "  %b(Cannot read I/O stats)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    }
+    
+    local rchar wchar rbytes wbytes syscr syscw
+    rchar=$(echo "$io_content" | grep "^rchar:" | awk '{print $2}')
+    wchar=$(echo "$io_content" | grep "^wchar:" | awk '{print $2}')
+    rbytes=$(echo "$io_content" | grep "^read_bytes:" | awk '{print $2}')
+    wbytes=$(echo "$io_content" | grep "^write_bytes:" | awk '{print $2}')
+    syscr=$(echo "$io_content" | grep "^syscr:" | awk '{print $2}')
+    syscw=$(echo "$io_content" | grep "^syscw:" | awk '{print $2}')
+    
+    # Ensure we have valid numbers
+    [[ "$rchar" =~ ^[0-9]+$ ]] || rchar=0
+    [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
+    [[ "$rbytes" =~ ^[0-9]+$ ]] || rbytes=0
+    [[ "$wbytes" =~ ^[0-9]+$ ]] || wbytes=0
+    
+    printf "  ${S9_BOLD}%-20s${S9_NC} %s (%s)\n" "Characters Read:" "$rchar" "$(s9_human_bytes "$rchar")"
+    printf "  ${S9_BOLD}%-20s${S9_NC} %s (%s)\n" "Characters Written:" "$wchar" "$(s9_human_bytes "$wchar")"
+    printf "  ${S9_BOLD}%-20s${S9_NC} %s (%s)\n" "Bytes Read (disk):" "$rbytes" "$(s9_human_bytes "$rbytes")"
+    printf "  ${S9_BOLD}%-20s${S9_NC} %s (%s)\n" "Bytes Written (disk):" "$wbytes" "$(s9_human_bytes "$wbytes")"
+    printf "  ${S9_BOLD}%-20s${S9_NC} %s read, %s write\n" "Syscalls:" "$syscr" "$syscw"
+}
+
+inspect_environment() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    s9_header "ENVIRONMENT VARIABLES"
+    
+    if [[ ! -r "$proc_dir/environ" ]]; then
+        printf "  %b(Permission denied)%b\n" "${S9_YELLOW}" "${S9_NC}"
+        return
+    fi
+    
+    local env_count
+    env_count=$(tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null | wc -l)
+    
+    printf "  %bShowing first 15 of %d variables:%b\n" "${S9_DIM}" "$env_count" "${S9_NC}"
+    echo ""
+    
+    tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null | head -15 | while read -r line; do
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        printf "  ${S9_BOLD}%s${S9_NC}=%b\n" "$key" "${value:0:60}${value:60:+...}"
+    done
+    
+    if (( env_count > 15 )); then
+        echo ""
+        printf "  %b... and %d more%b\n" "${S9_DIM}" "$((env_count - 15))" "${S9_NC}"
+    fi
+}
+
+inspect_json() {
+    local pid=$1
+    local proc_dir="$PROC_BASE/$pid"
+    
+    echo "{"
+    
+    # Basic Info
+    local status_content
+    status_content=$(cat "$proc_dir/status" 2>/dev/null) || { echo "  \"error\": \"Cannot read process status\""; echo "}"; return; }
+    
+    local name state ppid uid threads
+    name=$(echo "$status_content" | grep "^Name:" | awk '{print $2}')
+    state=$(echo "$status_content" | grep "^State:" | awk '{print $2}')
+    ppid=$(echo "$status_content" | grep "^PPid:" | awk '{print $2}')
+    uid=$(echo "$status_content" | grep "^Uid:" | awk '{print $2}')
+    threads=$(echo "$status_content" | grep "^Threads:" | awk '{print $2}')
+    local username
+    username=$(s9_uid_to_user "$uid")
+    local exe
+    exe=$(readlink "$proc_dir/exe" 2>/dev/null || echo "")
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
+    local cwd
+    cwd=$(readlink "$proc_dir/cwd" 2>/dev/null || echo "")
+    local ns_info
+    ns_info=$(s9_check_namespace "$pid")
+    
+    s9_json_kv "pid" "$pid"
+    s9_json_kv "name" "$name"
+    s9_json_kv "state" "$state"
+    s9_json_kv "ppid" "$ppid"
+    s9_json_kv "uid" "$uid"
+    s9_json_kv "user" "$username"
+    s9_json_kv "threads" "$threads"
+    s9_json_kv "exe" "$exe"
+    s9_json_kv "cwd" "$cwd"
+    s9_json_kv "cmdline" "$cmdline"
+    s9_json_kv "container" "$ns_info"
+    
+    # Memory
+    local vmsize vmrss
+    vmsize=$(echo "$status_content" | grep "^VmSize:" | awk '{print $2}')
+    vmrss=$(echo "$status_content" | grep "^VmRSS:" | awk '{print $2}')
+    vmsize=${vmsize:-0}
+    vmrss=${vmrss:-0}
+    
+    s9_json_kv "vm_size_kb" "$vmsize"
+    s9_json_kv "rss_kb" "$vmrss"
+    
+    # FDs
+    local fd_count
+    fd_count=$(s9_get_fd_count "$pid")
+    s9_json_kv "fd_count" "$fd_count"
+    
+    # IO
+    if [[ -r "$proc_dir/io" ]]; then
+        local io_content
+        io_content=$(cat "$proc_dir/io" 2>/dev/null)
+        local rchar wchar
+        rchar=$(echo "$io_content" | grep "^rchar:" | awk '{print $2}')
+        wchar=$(echo "$io_content" | grep "^wchar:" | awk '{print $2}')
+        s9_json_kv "io_read_chars" "${rchar:-0}"
+        s9_json_kv "io_write_chars" "${wchar:-0}" "last"
+    else
+        s9_json_kv "io_read_chars" "0"
+        s9_json_kv "io_write_chars" "0" "last"
+    fi
+    
+    echo "}"
+}
+
+#------------------------------------------------------------------------------
+# Main
+#------------------------------------------------------------------------------
+
+usage() {
+    printf "%bs9-inspect%b - Deep process inspection tool\n" "$S9_BOLD" "$S9_NC"
+    printf "Substrata9 v%s\n\n" "$S9_VERSION"
+    
+    printf "%bUSAGE:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-inspect <PID|process_name> [options]\n\n"
+    
+    printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    -f, --full      Include detailed memory map\n"
+    printf "    -e, --env       Show environment variables\n"
+    printf "    -j, --json      Output in JSON format\n"
+    printf "    --export FILE   Save report to FILE (strips colors for text)\n"
+    printf "    -q, --quiet     Minimal output (for scripting)\n"
+    printf "    -h, --help      Show this help\n"
+    printf "    -v, --version   Show version\n\n"
+    
+    printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-inspect 1234           # Inspect by PID\n"
+    printf "    s9-inspect nginx          # Inspect by name\n"
+    printf "    s9-inspect \$\$             # Inspect current shell\n"
+    printf "    s9-inspect --full \$(pgrep -f \"python app.py\")\n"
+    printf "    s9-inspect --json 1234 | jq .\n"
+    printf "    s9-inspect 1234 --export report.txt\n\n"
+    
+    printf "%bOUTPUT SECTIONS:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    IDENTITY    - PID, name, state, parent, user, command\n"
+    printf "    MEMORY      - Virtual size, RSS, segments breakdown\n"
+    printf "    FILE DESC   - Open files, sockets, pipes with targets\n"
+    printf "    SIGNALS     - Blocked, ignored, caught signal masks\n"
+    printf "    LIMITS      - Resource limits (ulimit values)\n"
+    printf "    I/O STATS   - Read/write bytes and syscall counts\n"
+    
+    exit 0
+}
+
+run_inspection() {
+    local pid=$1
+    
+    # JSON mode
+    if $JSON_MODE; then
+        inspect_json "$pid"
+        return 0
+    fi
+    
+    # Quiet mode: output key metrics only (for scripting)
+    if $QUIET_MODE; then
+        local rss fd_count state threads
+        rss=$(s9_get_rss "$pid")
+        fd_count=$(s9_get_fd_count "$pid")
+        state=$(s9_get_state "$pid")
+        threads=$(s9_get_threads "$pid")
+        echo "PID=$pid RSS=${rss}kB FDs=$fd_count STATE=$state THREADS=$threads"
+        return 0
+    fi
+    
+    local proc_name
+    proc_name=$(s9_get_comm "$pid")
+    s9_box_title "Substrata9 — Process Inspection Report" "Target: $proc_name (PID $pid)"
+    
+    # Run all inspections
+    inspect_basic "$pid"
+    inspect_memory "$pid"
+    inspect_file_descriptors "$pid"
+    inspect_signals "$pid"
+    inspect_limits "$pid"
+    inspect_io "$pid"
+    
+    if $SHOW_ENV; then
+        inspect_environment "$pid"
+    fi
+    
+    echo ""
+    s9_rule
+    printf "  %bGenerated:%b %s  %b│%b  %bKernel:%b %s  %b│%b  %bSubstrata9 v%s%b\n" \
+        "${S9_DIM}" "${S9_NC}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "${S9_DIM}" "${S9_NC}" \
+        "${S9_DIM}" "${S9_NC}" "$(uname -r)" \
+        "${S9_DIM}" "${S9_NC}" \
+        "${S9_DIM}" "$S9_VERSION" "${S9_NC}"
+    echo ""
+}
+
+main() {
+    local target=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--full)
+                SHOW_MEMORY_DETAILS=true
+                shift
+                ;;
+            -e|--env)
+                SHOW_ENV=true
+                shift
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            --export)
+                EXPORT_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -v|--version)
+                echo "s9-inspect version $S9_VERSION"
+                exit 0
+                ;;
+            -*)
+                s9_die "Unknown option: $1. Use --help for usage."
+                ;;
+            *)
+                target="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    [[ -z "$target" ]] && usage
+    
+    # Resolve PID
+    local pid
+    pid=$(s9_resolve_pid "$target") || exit 1
+    
+    # Handle Export
+    if [[ -n "$EXPORT_FILE" ]]; then
+        local capture_file
+        capture_file=$(mktemp) || s9_die "Cannot create temp file"
+        
+        # Run inspection and capture output
+        run_inspection "$pid" | tee "$capture_file"
+        
+        # Process export file
+        if $JSON_MODE; then
+            cp "$capture_file" "$EXPORT_FILE"
+        else
+            # Strip ANSI codes for text report
+            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE"
+        fi
+        
+        rm -f "$capture_file"
+        s9_info "Report saved to $EXPORT_FILE"
+    else
+        run_inspection "$pid"
+    fi
+}
+
+main "$@"

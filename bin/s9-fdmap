@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+#
+# s9-fdmap - File descriptor mapping across processes
+# Substrata9
+#
+# Author: Muskula Rahul
+#
+# Requirements: bash 4.0+, Linux with /proc filesystem
+#
+
+# Note: Using set -uo pipefail (without -e) to handle race conditions
+# when processes exit during /proc scanning
+
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+# Run initialization checks
+s9_init
+
+#------------------------------------------------------------------------------
+# Configuration
+#------------------------------------------------------------------------------
+SEARCH_FILE=""
+SEARCH_SOCKET=""
+FIND_LEAKS=false
+LEAK_THRESHOLD=100
+TOP_N=20
+QUIET_MODE=false
+JSON_MODE=false
+
+#------------------------------------------------------------------------------
+# FD Analysis Functions
+#------------------------------------------------------------------------------
+
+system_summary() {
+    if $JSON_MODE; then
+        echo "{"
+        echo "  \"summary\": ["
+    else
+        s9_box_title "Substrata9 — File Descriptor Summary" "System-wide FD analysis"
+        
+        printf "  %bScanning processes...%b\n" "${S9_DIM}" "${S9_NC}"
+        echo ""
+    fi
+    
+    # Use temp file for streaming sort (handles large process counts)
+    local tmp_file
+    tmp_file=$(mktemp) || s9_die "Cannot create temp file"
+    trap "rm -f '$tmp_file'" RETURN
+    
+    local total_fds=0
+    local total_procs=0
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        local fd_dir="$proc_dir/fd"
+        
+        [[ -r "$fd_dir" ]] || continue
+        
+        local fd_count
+        fd_count=$(ls -1 -- "$fd_dir" 2>/dev/null | wc -l)
+        
+        local name
+        name=$(s9_get_comm "$pid")
+        
+        local user
+        local uid
+        uid=$(awk '/^Uid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        user=$(s9_uid_to_user "$uid")
+        
+        total_fds=$((total_fds + fd_count))
+        ((total_procs++))
+        
+        echo "$fd_count|$pid|$name|$user" >> "$tmp_file"
+    done
+    
+    if ! $JSON_MODE; then
+        printf "  ${S9_BOLD}%-8s %-20s %-8s %s${S9_NC}\n" "PID" "PROCESS" "FDs" "USER"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    # Sort by FD count descending and show top N
+    local count=0
+    local first=true
+    
+    # Read sorted output
+    while IFS='|' read -r fd_count pid name user; do
+        [[ -z "$pid" ]] && continue
+        ((count++))
+        ((count > TOP_N)) && break
+        
+        if $JSON_MODE; then
+            if $first; then first=false; else echo ","; fi
+            echo "    {"
+            s9_json_kv "pid" "$pid" "" "    "
+            s9_json_kv "name" "$name" "" "    "
+            s9_json_kv "fd_count" "$fd_count" "" "    "
+            s9_json_kv "user" "$user" "last" "    "
+            echo -n "    }"
+        else
+            # Color high FD counts
+            local fd_color="$S9_NC"
+            if (( fd_count >= LEAK_THRESHOLD )); then
+                fd_color="$S9_RED"
+            elif (( fd_count >= LEAK_THRESHOLD / 2 )); then
+                fd_color="$S9_YELLOW"
+            fi
+            
+            printf "  %-8s %-20s %b%-8s${S9_NC} ${S9_DIM}%s${S9_NC}\n" \
+                "$pid" "${name:0:20}" "$fd_color" "$fd_count" "$user"
+        fi
+    done < <(sort -t'|' -k1 -rn "$tmp_file")
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+        echo "  \"stats\": {"
+        s9_json_kv "total_processes" "$total_procs"
+        s9_json_kv "total_fds" "$total_fds"
+        
+        # System-wide FD stats
+        if [[ -r /proc/sys/fs/file-nr ]]; then
+            local file_nr
+            file_nr=$(cat /proc/sys/fs/file-nr)
+            local allocated used max
+            allocated=$(echo "$file_nr" | awk '{print $1}')
+            max=$(echo "$file_nr" | awk '{print $3}')
+            s9_json_kv "system_allocated" "$allocated"
+            s9_json_kv "system_max" "$max" "last"
+        else
+            s9_json_kv "system_allocated" "0"
+            s9_json_kv "system_max" "0" "last"
+        fi
+        echo "  }"
+        echo "}"
+    else
+        if (( total_procs > TOP_N )); then
+            printf "  %b... and %d more processes%b\n" "${S9_DIM}" "$((total_procs - TOP_N))" "${S9_NC}"
+        fi
+        
+        echo ""
+        printf "%bTotal:%b %d processes, %d file descriptors\n" "${S9_BOLD}" "${S9_NC}" "$total_procs" "$total_fds"
+        
+        # System-wide FD stats
+        if [[ -r /proc/sys/fs/file-nr ]]; then
+            local file_nr
+            file_nr=$(cat /proc/sys/fs/file-nr)
+            local allocated used max
+            allocated=$(echo "$file_nr" | awk '{print $1}')
+            max=$(echo "$file_nr" | awk '{print $3}')
+            local percent
+            percent=$(echo "scale=1; ($allocated * 100) / $max" | bc)
+            printf "%bSystem:%b %s / %s FDs allocated (%s%%)\n" "${S9_BOLD}" "${S9_NC}" "$allocated" "$max" "$percent"
+        fi
+    fi
+}
+
+find_file_users() {
+    local target_file="$1"
+    
+    if $JSON_MODE; then
+        echo "{"
+        s9_json_kv "target_file" "$target_file"
+        echo "  ,\"processes\": ["
+    else
+        printf "%bProcesses with '%s' open:%b\n" "${S9_BOLD}" "$target_file" "${S9_NC}"
+        echo ""
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-6s %s${S9_NC}\n" "PID" "PROCESS" "FD" "TARGET"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local first=true
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        local fd_dir="$proc_dir/fd"
+        
+        [[ -r "$fd_dir" ]] || continue
+        
+        for fd in "$fd_dir"/*; do
+            [[ -e "$fd" ]] || continue
+            
+            local target
+            target=$(readlink "$fd" 2>/dev/null || echo "")
+            
+            if [[ "$target" == "$target_file" ]] || [[ "$target" == *"$target_file"* ]]; then
+                local name
+                name=$(s9_get_comm "$pid")
+                
+                local fd_num="${fd##*/}"
+                
+                if $JSON_MODE; then
+                    if $first; then first=false; else echo ","; fi
+                    echo "    {"
+                    s9_json_kv "pid" "$pid" "" "    "
+                    s9_json_kv "name" "$name" "" "    "
+                    s9_json_kv "fd" "$fd_num" "" "    "
+                    s9_json_kv "target" "$target" "last" "    "
+                    echo -n "    }"
+                else
+                    printf "  ${S9_CYAN}%-8s${S9_NC} %-20s ${S9_BOLD}%-6s${S9_NC} %s\n" \
+                        "$pid" "${name:0:20}" "$fd_num" "${target:0:40}"
+                fi
+                
+                ((found++))
+            fi
+        done
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+        s9_json_kv "count" "$found" "last"
+        echo "}"
+    else
+        if (( found == 0 )); then
+            printf "  %bNo processes found with this file open%b\n" "${S9_DIM}" "${S9_NC}"
+        else
+            echo ""
+            printf "%bFound:%b %d file descriptor(s) matching '%s'\n" "${S9_BOLD}" "${S9_NC}" "$found" "$target_file"
+        fi
+    fi
+}
+
+find_socket_users() {
+    local target_port="$1"
+    
+    # Validate port number
+    s9_validate_port "$target_port"
+    
+    if $JSON_MODE; then
+        echo "{"
+        s9_json_kv "target_port" "$target_port"
+        echo "  ,\"processes\": ["
+    else
+        printf "%bProcesses using port %s:%b\n" "${S9_BOLD}" "$target_port" "${S9_NC}"
+        echo ""
+        
+        # Convert port to hex for /proc/net matching
+        local port_hex
+        port_hex=$(printf "%04X" "$target_port")
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-10s %s${S9_NC}\n" "PID" "PROCESS" "PROTOCOL" "LOCAL ADDR"
+        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local first=true
+    local port_hex
+    port_hex=$(printf "%04X" "$target_port")
+    
+    # Check TCP connections
+    if [[ -r /proc/net/tcp ]]; then
+        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
+            [[ "$local_addr" == *":$port_hex" ]] || continue
+            
+            # Find process with this inode
+            for proc_dir in /proc/[0-9]*; do
+                local pid="${proc_dir##*/}"
+                [[ -r "$proc_dir/fd" ]] || continue
+                
+                for fd in "$proc_dir/fd"/*; do
+                    local target
+                    target=$(readlink "$fd" 2>/dev/null || echo "")
+                    if [[ "$target" == "socket:[$inode]" ]]; then
+                        local name
+                        name=$(s9_get_comm "$pid")
+                        
+                        if $JSON_MODE; then
+                            if $first; then first=false; else echo ","; fi
+                            echo "    {"
+                            s9_json_kv "pid" "$pid" "" "    "
+                            s9_json_kv "name" "$name" "" "    "
+                            s9_json_kv "protocol" "TCP" "" "    "
+                            s9_json_kv "local_addr" "$local_addr" "last" "    "
+                            echo -n "    }"
+                        else
+                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
+                                "$pid" "${name:0:20}" "TCP" "$local_addr"
+                        fi
+                        ((found++))
+                    fi
+                done
+            done
+        done < <(tail -n +2 /proc/net/tcp 2>/dev/null)
+    fi
+    
+    # Check UDP connections
+    if [[ -r /proc/net/udp ]]; then
+        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
+            [[ "$local_addr" == *":$port_hex" ]] || continue
+            
+            for proc_dir in /proc/[0-9]*; do
+                local pid="${proc_dir##*/}"
+                [[ -r "$proc_dir/fd" ]] || continue
+                
+                for fd in "$proc_dir/fd"/*; do
+                    local target
+                    target=$(readlink "$fd" 2>/dev/null || echo "")
+                    if [[ "$target" == "socket:[$inode]" ]]; then
+                        local name
+                        name=$(s9_get_comm "$pid")
+                        
+                        if $JSON_MODE; then
+                            if $first; then first=false; else echo ","; fi
+                            echo "    {"
+                            s9_json_kv "pid" "$pid" "" "    "
+                            s9_json_kv "name" "$name" "" "    "
+                            s9_json_kv "protocol" "UDP" "" "    "
+                            s9_json_kv "local_addr" "$local_addr" "last" "    "
+                            echo -n "    }"
+                        else
+                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
+                                "$pid" "${name:0:20}" "UDP" "$local_addr"
+                        fi
+                        ((found++))
+                    fi
+                done
+            done
+        done < <(tail -n +2 /proc/net/udp 2>/dev/null)
+    fi
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+        s9_json_kv "count" "$found" "last"
+        echo "}"
+    else
+        if (( found == 0 )); then
+            printf "  %bNo processes found using port %s%b\n" "${S9_DIM}" "$target_port" "${S9_NC}"
+        else
+            echo ""
+            printf "%bFound:%b %d connection(s) on port %s\n" "${S9_BOLD}" "${S9_NC}" "$found" "$target_port"
+        fi
+    fi
+}
+
+detect_leaks() {
+    if $JSON_MODE; then
+        echo "{"
+        s9_json_kv "threshold" "$LEAK_THRESHOLD"
+        echo "  ,\"leaks\": ["
+    else
+        s9_box_title "Substrata9 — FD Leak Detection" "Threshold: $LEAK_THRESHOLD FDs"
+        
+        printf "  ${S9_BOLD}%-8s %-20s %-8s %-18s %s${S9_NC}\n" "PID" "PROCESS" "FDs" "BREAKDOWN" "USER"
+        printf "  ${S9_DIM}──────────────────────────────────────────────────────────────────────${S9_NC}\n"
+    fi
+    
+    local found=0
+    local first=true
+    
+    for proc_dir in /proc/[0-9]*; do
+        local pid="${proc_dir##*/}"
+        local fd_dir="$proc_dir/fd"
+        
+        [[ -r "$fd_dir" ]] || continue
+        
+        local fd_count
+        fd_count=$(ls -1 -- "$fd_dir" 2>/dev/null | wc -l)
+        
+        if (( fd_count >= LEAK_THRESHOLD )); then
+            local name
+            name=$(s9_get_comm "$pid")
+            
+            local user
+            local uid
+            uid=$(awk '/^Uid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+            user=$(s9_uid_to_user "$uid")
+            
+            # Count FD types
+            local files=0 sockets=0 pipes=0 other=0
+            for fd in "$fd_dir"/*; do
+                [[ -e "$fd" ]] || continue
+                local target
+                target=$(readlink "$fd" 2>/dev/null || echo "")
+                
+                case "$target" in
+                    socket:*) ((sockets++)) ;;
+                    pipe:*) ((pipes++)) ;;
+                    /dev/*|anon_inode:*) ((other++)) ;;
+                    *) ((files++)) ;;
+                esac
+            done
+            
+            local breakdown="${files}f/${sockets}s/${pipes}p/${other}o"
+            
+            if $JSON_MODE; then
+                if $first; then first=false; else echo ","; fi
+                echo "    {"
+                s9_json_kv "pid" "$pid" "" "    "
+                s9_json_kv "name" "$name" "" "    "
+                s9_json_kv "fd_count" "$fd_count" "" "    "
+                s9_json_kv "breakdown" "$breakdown" "" "    "
+                s9_json_kv "user" "$user" "last" "    "
+                echo -n "    }"
+            else
+                # Color based on severity
+                local fd_color="$S9_YELLOW"
+                if (( fd_count >= LEAK_THRESHOLD * 5 )); then
+                    fd_color="$S9_RED"
+                fi
+                
+                printf "  ${S9_RED}%-8s${S9_NC} %-20s %b%-8s${S9_NC} %-18s ${S9_DIM}%s${S9_NC}\n" \
+                    "$pid" "${name:0:20}" "$fd_color" "$fd_count" "$breakdown" "$user"
+            fi
+            
+            ((found++))
+        fi
+    done
+    
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+        s9_json_kv "count" "$found" "last"
+        echo "}"
+    else
+        if (( found == 0 )); then
+            printf "  ${S9_GREEN}✓ No potential leaks detected${S9_NC}\n"
+        else
+            echo ""
+            printf "%b! Found %d process(es) with high FD counts%b\n" "${S9_YELLOW}" "$found" "${S9_NC}"
+            echo ""
+            printf "%bBreakdown legend: f=files, s=sockets, p=pipes, o=other%b\n" "${S9_DIM}" "${S9_NC}"
+            printf "%bUse 's9-inspect <PID>' for detailed FD analysis%b\n" "${S9_DIM}" "${S9_NC}"
+        fi
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Main
+#------------------------------------------------------------------------------
+
+usage() {
+    printf "%bs9-fdmap%b - File descriptor mapping across processes\n" "$S9_BOLD" "$S9_NC"
+    printf "Substrata9 v%s\n\n" "$S9_VERSION"
+    
+    printf "%bUSAGE:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-fdmap [options]\n\n"
+    
+    printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    --file PATH         Find which processes have this file open\n"
+    printf "    --socket PORT       Find which processes use this port\n"
+    printf "    --leaks             Detect processes with high FD counts\n"
+    printf "    --threshold N       FD count threshold for leak detection (default: 100)\n"
+    printf "    --top N             Show top N processes in summary (default: 20)\n"
+    printf "    -j, --json          Output in JSON format\n"
+    printf "    -q, --quiet         Minimal output (for scripting)\n"
+    printf "    -h, --help          Show this help\n"
+    printf "    -v, --version       Show version\n\n"
+    
+    printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    s9-fdmap                            # System-wide summary (sorted by FD count)\n"
+    printf "    s9-fdmap --file /var/log/syslog     # Who has this file open?\n"
+    printf "    s9-fdmap --socket 8080              # Who is using port 8080?\n"
+    printf "    s9-fdmap --leaks --threshold 50     # Find potential FD leaks\n"
+    printf "    s9-fdmap --json | jq .              # Output as JSON\n\n"
+    
+    printf "%bOUTPUT:%b\n" "$S9_BOLD" "$S9_NC"
+    printf "    Summary mode shows processes sorted by FD count (highest first).\n"
+    printf "    Leak detection shows breakdown: files/sockets/pipes/other\n"
+    
+    exit 0
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file)
+                SEARCH_FILE="$2"
+                shift 2
+                ;;
+            --socket)
+                SEARCH_SOCKET="$2"
+                shift 2
+                ;;
+            --leaks)
+                FIND_LEAKS=true
+                shift
+                ;;
+            --threshold)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Threshold must be a number"
+                LEAK_THRESHOLD="$2"
+                shift 2
+                ;;
+            --top)
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Top N must be a number"
+                TOP_N="$2"
+                shift 2
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -v|--version)
+                echo "s9-fdmap version $S9_VERSION"
+                exit 0
+                ;;
+            *)
+                s9_die "Unknown option: $1. Use --help for usage."
+                ;;
+        esac
+    done
+    
+    # Quiet mode: output counts only
+    if $QUIET_MODE; then
+        local total_fds=0 total_procs=0 leaks=0
+        for proc_dir in /proc/[0-9]*; do
+            local pid="${proc_dir##*/}"
+            [[ -r "$proc_dir/fd" ]] || continue
+            local fd_count
+            fd_count=$(ls -1 -- "$proc_dir/fd" 2>/dev/null | wc -l)
+            total_fds=$((total_fds + fd_count))
+            ((total_procs++))
+            if (( fd_count >= LEAK_THRESHOLD )); then ((leaks++)); fi
+        done
+        echo "PROCESSES=$total_procs TOTAL_FDS=$total_fds POTENTIAL_LEAKS=$leaks"
+        return 0
+    fi
+    
+    if ! $JSON_MODE; then
+        echo ""
+    fi
+    
+    # Execute requested operation
+    if [[ -n "$SEARCH_FILE" ]]; then
+        find_file_users "$SEARCH_FILE"
+    elif [[ -n "$SEARCH_SOCKET" ]]; then
+        find_socket_users "$SEARCH_SOCKET"
+    elif $FIND_LEAKS; then
+        detect_leaks
+    else
+        system_summary
+    fi
+    
+    if ! $JSON_MODE; then
+        echo ""
+    fi
+}
+
+main "$@"

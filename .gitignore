@@ -1,0 +1,32 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.log
+*.tmp
+
+# Test output
+tests/results/
+benchmarks/results/*.txt
+
+# User snapshots
+.substrata9/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled kernel module
+kernel/*.ko
+kernel/*.mod.c
+kernel/*.mod.o
+kernel/.*.cmd
+kernel/Module.symvers
+kernel/modules.order
