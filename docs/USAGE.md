@@ -4,9 +4,6 @@ Comprehensive reference for all tools in the Substrata9 toolkit, with practical 
 
 > 💡 **See the tools in action!** Check out the [animated demos in the README](../README.md#-demo) or browse the [GIFS/](../GIFS/) folder.
 
----
-
-
 ## Prerequisites
 
 Requirements:
@@ -19,9 +16,6 @@ Requirements:
 | **Dependencies** | `awk`, `sed`, `grep`, `bc` — standard on most systems |
 
 > **Note:** Many `/proc` files require root access. Run with `sudo` for complete visibility.
-
----
-
 
 ## s9-inspect — Process Inspection
 
@@ -87,8 +81,6 @@ The report is organized into sections:
 | **SIGNALS** | Which signals are blocked, ignored, or have handlers installed |
 | **LIMITS** | Resource limits (ulimits) — max open files, max memory, etc. |
 | **I/O STATS** | Bytes read/written and syscall counts (requires root) |
-
----
 
 
 ## s9-tree — Process Hierarchy
@@ -169,9 +161,6 @@ s9-tree --pid $(pgrep -o python)
 # → Shows the process tree rooted at the oldest python process
 ```
 
----
-
-
 ## s9-fdmap — File Descriptor Analysis
 
 **Function:** System-wide file descriptor scanning for leak detection and file/socket ownership identification.
@@ -237,9 +226,6 @@ s9-fdmap --leaks --threshold 100
 s9-inspect <PID> | grep -A 50 "FILE DESCRIPTORS"
 # → See exactly what files/sockets are being held open
 ```
-
----
-
 
 ## s9-snapshot — Temporal Analysis
 
@@ -330,9 +316,6 @@ Metrics compared:
 |----------|--------------|
 | `S9_SNAPSHOT_DIR` | Override where snapshots are stored (default: `~/.substrata9/snapshots`) |
 
----
-
-
 ## s9-anomaly — System Health Scanner
 
 **Function:** System-wide scan for common issues — zombie processes, resource hogs, and unusual process states.
@@ -404,9 +387,6 @@ s9-anomaly
 #   - Processes stuck in D-state (waiting for slow disk)
 ```
 
----
-
-
 ## Troubleshooting
 
 ### "Permission Denied" Errors
@@ -456,12 +436,9 @@ chmod +x bin/*
 chmod +x examples/*
 ```
 
-
 ### Still Stuck?
 
 Check the [Troubleshooting Guide](TROUBLESHOOTING.md) for more solutions, or [open an issue](https://github.com/iamrahulreddy/Substrata9/issues).
-
----
 
 
 ## Advanced Usage
@@ -520,9 +497,6 @@ echo "--- Top FD Consumers ---"
 s9-fdmap --top 10
 ```
 
----
-
-
 ## See Also
 
 - [Architecture Guide](ARCHITECTURE.md) — How Substrata9 works under the hood
@@ -530,7 +504,5 @@ s9-fdmap --top 10
 - [Troubleshooting](TROUBLESHOOTING.md) — Common issues and solutions
 - [Examples](../examples/) — Ready-to-use debugging scripts
 - [Contributing](../CONTRIBUTING.md) — How to contribute
-
----
 
 *Part of Substrata9 — Linux Process Archaeology Toolkit*

@@ -4,8 +4,6 @@ Technical overview of the toolkit's design, data flow, and internal structure.
 
 > 🎬 **Want to see these tools in action?** Check the [animated demos](../README.md#-demo) or browse `GIFS/`.
 
----
-
 ## Overview
 
 Substrata9 interfaces directly with the Linux `/proc` filesystem to extract process information. This provides the same data source used by `ps`, `top`, and similar tools, with full control over extraction and presentation.
@@ -14,11 +12,11 @@ Here's the high-level structure:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         User Space                               │
+│                         User Space                              │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   Tools (bin/)                    Library (lib/)                 │
-│   ┌─────────────┐                ┌─────────────────┐             │
+│                                                                 │
+│   Tools (bin/)                    Library (lib/)                │
+│   ┌─────────────┐                ┌─────────────────┐            │
 │   │ s9-inspect  │───────────────▶│                 │            │
 │   │ s9-tree     │───────────────▶│  s9-common.sh   │            │
 │   │ s9-fdmap    │───────────────▶│                 │            │
@@ -26,12 +24,12 @@ Here's the high-level structure:
 │   │ s9-anomaly  │───────────────▶│  Formatting,    │            │
 │   └─────────────┘                │  /proc helpers  │            │
 │         │                        └─────────────────┘            │
-│         │                                                        │
-│         ▼                                                        │
+│         │                                                       │
+│         ▼                                                       │
 ├─────────────────────────────────────────────────────────────────┤
-│                      /proc Filesystem                            │
+│                      /proc Filesystem                           │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
+│                                                                 │
 │   /proc/[pid]/status    → Process state, memory, threads        │
 │   /proc/[pid]/fd/       → Open file descriptors                 │
 │   /proc/[pid]/maps      → Memory regions                        │
@@ -39,21 +37,19 @@ Here's the high-level structure:
 │   /proc/[pid]/cmdline   → Command line arguments                │
 │   /proc/[pid]/environ   → Environment variables                 │
 │   /proc/[pid]/limits    → Resource limits                       │
-│                                                                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Linux Kernel                              │
-│                                                                  │
+│                        Linux Kernel                             │
+│                                                                 │
 │   Process table, memory management, file descriptor tables...   │
-│                                                                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 The kernel maintains all this information internally. When you read `/proc/1234/status`, the kernel generates the text on the fly from its internal `task_struct`. There's no file on disk—it's synthesized when you ask for it.
-
----
 
 
 ## Core Library: `s9-common.sh`
@@ -79,8 +75,6 @@ Here's what the library handles:
 | **JSON** | `s9_json_kv`, `s9_sanitize_json` | Generate valid JSON for `--json` output |
 
 The library is loaded via `source` rather than as a subprocess. This executes in the current shell context, making variables available to the calling script without fork overhead.
-
----
 
 
 ## Tool Internals
@@ -277,8 +271,6 @@ System-wide health check that identifies common issues.
 
 Uses `set -uo pipefail` instead of `set -euo pipefail`. The `-e` flag exits on any error, but when scanning `/proc`, processes can terminate between listing and reading. This approach handles race conditions gracefully rather than crashing.
 
----
-
 
 ## Design Decisions
 
@@ -303,8 +295,6 @@ Uses `set -uo pipefail` instead of `set -euo pipefail`. The `-e` flag exits on a
 - `ps` output format varies between systems (GNU vs BSD)
 - Avoids additional dependencies
 - Provides access to data `ps` doesn't expose (signal masks, detailed limits)
-
----
 
 
 ## Error Handling
@@ -352,9 +342,6 @@ sanitized="${input//[^a-zA-Z0-9_.-]/}"
 [[ "$pid" =~ ^[0-9]+$ ]] || s9_die "Invalid PID: $pid"
 ```
 
----
-
-
 ## Future Directions
 
 Planned enhancements:
@@ -365,8 +352,6 @@ Planned enhancements:
 | **Plugin system** | Planned | Custom parsers for specific `/proc` files |
 | **TUI mode** | Considering | Interactive terminal UI like `htop` |
 | **Prometheus exporter** | Considering | Export metrics for monitoring systems |
-
----
 
 
 ## Contributing
@@ -379,7 +364,5 @@ Guidelines for adding or modifying tools:
 4. **Add `--help`** — standard CLI convention
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for more.
-
----
 
 *Part of Substrata9 — Linux Process Archaeology Toolkit*

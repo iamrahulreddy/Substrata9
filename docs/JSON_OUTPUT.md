@@ -2,8 +2,6 @@
 
 All Substrata9 tools support `--json` output for integration with scripts, dashboards, and automation pipelines. This document covers the JSON schemas for each tool.
 
----
-
 
 ## Quick Start
 
@@ -26,9 +24,6 @@ s9-inspect 1234 --json | jq '.rss_kb'
 # Find processes using more than 100MB
 s9-tree --json | jq '.children[] | select(.rss_kb > 102400) | .name'
 ```
-
----
-
 
 ## s9-inspect
 
@@ -96,15 +91,11 @@ s9-inspect 1234 --json | jq 'if .container != "" then "containerized" else "host
 s9-inspect 1234 --json | jq -r 'to_entries | .[] | "\(.key)=\(.value)"'
 ```
 
----
-
-
 ## s9-tree
 
 Returns a recursive tree structure representing the process hierarchy.
 
 **When to use:** You need to analyze parent-child relationships programmatically, or build a visualization.
-
 
 ### Schema
 
@@ -177,9 +168,6 @@ s9-tree --json | jq '[.. | .pid? // empty] | length'
 s9-tree --json | jq '.children[] | {name, pid}'
 ```
 
----
-
-
 ## s9-fdmap
 
 Returns file descriptor information, either as a summary or search results.
@@ -250,9 +238,6 @@ s9-fdmap --json | jq '.summary[] | select((.fd_count | tonumber) > 500)'
 # Calculate FD usage percentage
 s9-fdmap --json | jq '.stats | ((.total_fds | tonumber) / (.system_max | tonumber) * 100) | round'
 ```
-
----
-
 
 ## s9-anomaly
 
@@ -362,9 +347,6 @@ s9-anomaly --json | jq '{zombies: (.zombies | length), hogs: (.hogs | length), s
 s9-anomaly --json | jq '.hogs[] | select((.rss_percent | tonumber) > 50)'
 ```
 
----
-
-
 ## s9-snapshot
 
 Returns status information for capture operations and comparison results for diffs.
@@ -452,9 +434,6 @@ s9-snapshot diff baseline after_load --json | jq '.memory.rss_diff_kb | tonumber
 s9-snapshot diff baseline after_load --json | jq 'if .assessment.overall == "critical" then "ALERT!" else "OK" end'
 ```
 
----
-
-
 ## Tips for Working with JSON Output
 
 ### Handling Missing Fields
@@ -490,15 +469,10 @@ The JSON output is designed to be dashboard-friendly:
 s9-fdmap --json | jq -r '.summary[] | "fd_count{pid=\"\(.pid)\",name=\"\(.name)\"} \(.fd_count)"'
 ```
 
----
-
-
 ## See Also
 
 - [Usage Guide](USAGE.md) — Detailed usage for all tools
 - [Architecture](ARCHITECTURE.md) — How Substrata9 works internally
 - [Examples](../examples/) — Ready-to-use scripts
-
----
 
 *Part of Substrata9 — Linux Process Archaeology Toolkit*

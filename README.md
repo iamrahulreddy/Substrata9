@@ -79,6 +79,14 @@ I designed Substrata9 to function as a transparency layer for the Linux kernel, 
 
 This direct approach ensures that the data presented is an accurate, unadulterated representation of the kernel's current state.
 
+> [!NOTE]
+> **Recursion & Stack Depth**  
+> `s9-tree` uses recursive function calls to traverse the process hierarchy.  
+> While this approach is elegant and readable, it is theoretically limited by the shell’s stack size.  
+>  
+> In practice, typical Linux process trees rarely exceed a depth of ~10, keeping execution well within safe bounds.  
+> Only artificially constructed, extremely deep process chains may risk stack exhaustion.
+
 ## Requirements
 
 * **Operating System:** Linux (Kernel 4.15 or newer recommended).

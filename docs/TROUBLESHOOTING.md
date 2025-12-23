@@ -2,9 +2,6 @@
 
 Common issues and solutions.
 
----
-
-
 ## Permission Denied Errors
 
 **What you're seeing:**
@@ -25,7 +22,6 @@ Linux protects process information. You can only see full details for:
 
 This is a security feature, not a bug.
 
-
 **The fix:**
 
 Run with `sudo`:
@@ -41,9 +37,6 @@ sudo s9-anomaly
 
 Some systems have additional restrictions (SELinux, AppArmor, container isolation). Check your security policies if `sudo` doesn't help.
 
----
-
-
 ## "Command not found" Errors
 
 **What you're seeing:**
@@ -51,7 +44,6 @@ Some systems have additional restrictions (SELinux, AppArmor, container isolatio
 ```bash
 s9-inspect: command not found
 ```
-
 
 **Why it happens:**
 
@@ -75,10 +67,6 @@ source ~/.bashrc
 # Option 4: Install system-wide
 sudo make install
 ```
-
----
-
-
 ## Missing Dependencies
 
 **What you're seeing:**
@@ -110,9 +98,6 @@ apk add bc
 
 If you see errors about `awk`, `sed`, or `grep`, something is very wrong with your system — these are part of the base install on virtually all Linux distributions.
 
----
-
-
 ## "Process not found" Errors
 
 **What you're seeing:**
@@ -121,7 +106,6 @@ If you see errors about `awk`, `sed`, or `grep`, something is very wrong with yo
 Warning: Process 12345 does not exist
 Warning: No process found matching 'myapp'
 ```
-
 
 **Why it happens:**
 
@@ -145,9 +129,6 @@ s9-inspect python
 # → "Multiple processes found matching 'python': 1234, 5678, 9012"
 # → Pick the specific PID you want
 ```
-
----
-
 
 ## Weird Characters in Output
 
@@ -178,9 +159,6 @@ s9-tree | less -R
 **Using an older terminal?**
 
 Substrata9 detects "dumb" terminals and disables colors automatically. If detection isn't working, set `TERM=dumb` or `NO_COLOR=1`.
-
----
-
 
 ## JSON Output Issues
 
@@ -214,9 +192,6 @@ sudo s9-inspect 1234 --json | jq .
 **Parsing errors?**
 
 If you're getting JSON parse errors, please [open an issue](https://github.com/iamrahulreddy/Substrata9/issues) — that's a bug that should be fixed.
-
----
-
 
 ## 🐧 WSL-Specific Issues
 
@@ -267,9 +242,6 @@ WSL's networking stack can be finicky, especially WSL1.
 - Make sure WSL is up to date: `wsl --update`
 - If persistent, try WSL2 which has better Linux compatibility
 
----
-
-
 ## Scripts Not Executable
 
 **What you're seeing:**
@@ -295,9 +267,6 @@ chmod +x lib/*
 **Cloned on Windows?**
 
 Git on Windows sometimes doesn't preserve execute permissions. The `chmod` fix above will sort it out.
-
----
-
 
 ## Slow Performance
 
@@ -328,9 +297,6 @@ s9-anomaly --zombies           # Just zombies, not full scan
 **Need faster?**
 
 For high-frequency monitoring, consider compiled tools like `htop`, `atop`, or eBPF-based solutions. Substrata9 is optimized for interactive diagnostic work, not continuous monitoring.
-
----
-
 
 ## Zombie Processes Won't Go Away
 
@@ -365,9 +331,6 @@ sudo systemctl restart <service>
 sudo kill <parent_pid>
 ```
 
----
-
-
 ## Still Stuck?
 
 If none of the above helps:
@@ -390,15 +353,10 @@ If none of the above helps:
 
 [Open an issue on GitHub](https://github.com/iamrahulreddy/Substrata9/issues)
 
----
-
-
 ## See Also
 
 - [Usage Guide](USAGE.md) — Detailed usage for all tools
 - [Architecture](ARCHITECTURE.md) — How Substrata9 works internally
-- [Contributing](../CONTRIBUTING.md) — Help us improve!
-
----
+- [Contributing](../CONTRIBUTING.md) — To contribute!
 
 *Part of Substrata9 — Linux Process Archaeology Toolkit*
