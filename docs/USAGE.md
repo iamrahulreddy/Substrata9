@@ -37,7 +37,9 @@ s9-inspect <PID | process_name> [options]
 |--------|--------------|
 | `-f, --full` | Include detailed memory map (heap, stack, shared libraries) |
 | `-e, --env` | Show the process's environment variables |
+| `-q, --quiet` | Minimal output (for scripting) |
 | `--json` | Output as JSON for scripting |
+| `--export FILE` | Save report to FILE (strips colors for text) |
 | `-h, --help` | Show help message |
 | `-v, --version` | Show version |
 

@@ -94,6 +94,8 @@ sudo dnf install bc
 apk add bc
 ```
 
+> **Note:** Substrata9 includes a built-in `bc` fallback that uses `awk` for basic arithmetic. If you don't need advanced `bc` features (like `sqrt`, `sin`), the tools will work without installing `bc`.
+
 **Other missing tools?**
 
 If you see errors about `awk`, `sed`, or `grep`, something is very wrong with your system — these are part of the base install on virtually all Linux distributions.

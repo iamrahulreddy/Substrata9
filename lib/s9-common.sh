@@ -20,7 +20,7 @@ S9_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd || echo
 #------------------------------------------------------------------------------
 # Version
 #------------------------------------------------------------------------------
-S9_VERSION="1.1.0"
+S9_VERSION="1.2.0"
 
 #------------------------------------------------------------------------------
 # Colors (with terminal detection)
@@ -211,15 +211,18 @@ s9_box_title() {
 # Sanitize string for JSON (escape quotes and backslashes)
 s9_sanitize_json() {
     local input="$1"
-    # Escape backslash first, then double quotes, then newlines, tabs, etc.
-    # Using python or jq would be safer but we want zero dependencies
-    # This is a basic implementation for common cases
-    input="${input//\\/\\\\}"
-    input="${input//\"/\\\"}"
-    input="${input//$'\n'/\\n}"
-    input="${input//$'\r'/\\r}"
-    input="${input//$'\t'/\\t}"
-    echo "$input"
+    # Escape backslash first, then double quotes, then control characters
+    # This handles the most common cases that could break JSON parsing
+    input="${input//\\/\\\\}"      # Backslash
+    input="${input//\"/\\\"}"      # Double quote
+    input="${input//$'\n'/\\n}"    # Newline
+    input="${input//$'\r'/\\r}"    # Carriage return
+    input="${input//$'\t'/\\t}"    # Tab
+    input="${input//$'\f'/\\f}"    # Form feed
+    input="${input//$'\b'/\\b}"    # Backspace
+    # Remove any remaining control characters (0x00-0x1F except those already escaped)
+    # Using tr to strip them as bash parameter expansion can't handle null bytes
+    echo "$input" | tr -d '\000-\007\013\016-\037'
 }
 
 # Output JSON key-value pair
@@ -438,31 +441,49 @@ s9_get_fd_count() {
 # Check if process is in a container/namespace
 s9_check_namespace() {
     local pid=$1
-    local init_pid=1
     
-    # If /proc/1/cgroup and /proc/$pid/cgroup differ significantly, likely containerized
-    # This is a heuristic
-    
+    # Look for container fingerprints in cgroup (handles both v1 and v2)
     if [[ -f "/proc/$pid/cgroup" ]]; then
-        if grep -q "docker" "/proc/$pid/cgroup" 2>/dev/null; then
+        local cgroup_content
+        cgroup_content=$(cat "/proc/$pid/cgroup" 2>/dev/null) || cgroup_content=""
+        
+        if [[ "$cgroup_content" == *"docker"* ]]; then
             echo "docker"
             return 0
-        elif grep -q "lxc" "/proc/$pid/cgroup" 2>/dev/null; then
+        elif [[ "$cgroup_content" == *"containerd"* ]]; then
+            echo "containerd"
+            return 0
+        elif [[ "$cgroup_content" == *"lxc"* ]]; then
             echo "lxc"
             return 0
-        elif grep -q "kubepods" "/proc/$pid/cgroup" 2>/dev/null; then
+        elif [[ "$cgroup_content" == *"kubepods"* ]] || [[ "$cgroup_content" == *"kubelet"* ]]; then
             echo "k8s"
+            return 0
+        elif [[ "$cgroup_content" == *"podman"* ]]; then
+            echo "podman"
             return 0
         fi
     fi
     
-    # Check namespace inodes if possible (requires root usually)
-    if [[ -r "/proc/$pid/ns/mnt" ]] && [[ -r "/proc/1/ns/mnt" ]]; then
+    # Check PID namespace (most reliable indicator of containerization)
+    if [[ -r "/proc/$pid/ns/pid" ]] && [[ -r "/proc/1/ns/pid" ]]; then
         local pid_ns init_ns
-        pid_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "")
-        init_ns=$(readlink "/proc/1/ns/mnt" 2>/dev/null || echo "")
+        pid_ns=$(readlink "/proc/$pid/ns/pid" 2>/dev/null || echo "")
+        init_ns=$(readlink "/proc/1/ns/pid" 2>/dev/null || echo "")
         
-        if [[ "$pid_ns" != "$init_ns" ]]; then
+        if [[ -n "$pid_ns" ]] && [[ -n "$init_ns" ]] && [[ "$pid_ns" != "$init_ns" ]]; then
+            echo "namespace"
+            return 0
+        fi
+    fi
+    
+    # Last resort: check mount namespace
+    if [[ -r "/proc/$pid/ns/mnt" ]] && [[ -r "/proc/1/ns/mnt" ]]; then
+        local mnt_ns init_mnt_ns
+        mnt_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "")
+        init_mnt_ns=$(readlink "/proc/1/ns/mnt" 2>/dev/null || echo "")
+        
+        if [[ -n "$mnt_ns" ]] && [[ -n "$init_mnt_ns" ]] && [[ "$mnt_ns" != "$init_mnt_ns" ]]; then
             echo "namespace"
             return 0
         fi
@@ -521,14 +542,29 @@ s9_validate_safe_dir() {
     local dir="$1"
     local resolved
     
-    # Resolve to absolute path
-    resolved=$(cd "$dir" 2>/dev/null && pwd) || resolved="$dir"
+    # Resolve to absolute path, following symlinks
+    if command -v realpath &>/dev/null; then
+        resolved=$(realpath -m "$dir" 2>/dev/null) || resolved=""
+    else
+        # Fallback: try cd + pwd
+        resolved=$(cd "$dir" 2>/dev/null && pwd -P) || resolved=""
+    fi
+    
+    # If resolution failed, use the original path
+    [[ -z "$resolved" ]] && resolved="$dir"
     
     # Check if under HOME or /tmp
     if [[ "$resolved" != "$HOME"* ]] && [[ "$resolved" != "/tmp"* ]]; then
         s9_warn "Directory '$dir' is outside safe locations (HOME or /tmp)"
         return 1
     fi
+    
+    # Check if writable (if it exists)
+    if [[ -d "$resolved" ]] && [[ ! -w "$resolved" ]]; then
+        s9_warn "Directory '$resolved' is not writable"
+        return 1
+    fi
+    
     return 0
 }
 
@@ -640,9 +676,9 @@ s9_compare_row() {
         # Calculate percentage and ensure proper formatting (add leading zero if needed)
         percent=$(echo "scale=1; ($diff * 100) / $val1" | bc 2>/dev/null || echo "0")
         # Fix leading zero for decimals like -.1 → -0.1 or .5 → 0.5
-        if [[ "$percent" == .* ]]; then
+        if [[ "$percent" =~ ^\\. ]]; then
             percent="0$percent"
-        elif [[ "$percent" == -.* ]]; then
+        elif [[ "$percent" =~ ^-\\. ]]; then
             percent="-0${percent#-}"
         fi
         percent="${percent}%"
@@ -721,8 +757,13 @@ s9_decode_signals() {
     fi
     
     # Convert hex to decimal safely
+    # /proc outputs hex without 0x prefix, so strip it if present and normalize
     local num
-    num=$((16#${mask##0x})) 2>/dev/null || num=0
+    mask="${mask#0x}"  # Strip 0x prefix if present
+    mask="${mask#0X}"  # Also handle uppercase
+    # Handle large hex values by taking only the last 8 characters (32 signals max)
+    [[ ${#mask} -gt 8 ]] && mask="${mask: -8}"
+    num=$((16#$mask)) 2>/dev/null || num=0
     
     for i in {1..31}; do
         if (( (num >> (i-1)) & 1 )); then

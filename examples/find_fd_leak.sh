@@ -95,6 +95,12 @@ if [[ -z "$TARGET_PID" ]]; then
         fi
     done
     
+    if [[ -z "$max_pid" ]]; then
+        printf "%bError:%b No accessible processes found (permission denied?)\n" "${S9_RED}" "${S9_NC}"
+        printf "%bTry running with sudo for full access.%b\n" "${S9_DIM}" "${S9_NC}"
+        exit 1
+    fi
+    
     TARGET_PID="$max_pid"
     printf "  Selected: PID %b%s%b (%d FDs)\n" "${S9_CYAN}" "$TARGET_PID" "${S9_NC}" "$max_fds"
 fi

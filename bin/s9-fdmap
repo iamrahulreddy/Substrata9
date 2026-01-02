@@ -54,7 +54,7 @@ system_summary() {
     # Use temp file for streaming sort (handles large process counts)
     local tmp_file
     tmp_file=$(mktemp) || s9_die "Cannot create temp file"
-    trap "rm -f '$tmp_file'" RETURN
+    trap "rm -f '$tmp_file'" EXIT
     
     local total_fds=0
     local total_procs=0

@@ -30,6 +30,19 @@ printf "%b║  Substrata9 — Test Suite                                        
 printf "%b╚════════════════════════════════════════════════════════════════════╝%b\n" "${BOLD}" "${NC}"
 echo ""
 
+# Dependency checks
+LIB_FILE="$ROOT_DIR/lib/s9-common.sh"
+if [[ ! -f "$LIB_FILE" ]]; then
+    printf "%bError: Core library not found: %s%b\n" "${RED}" "$LIB_FILE" "${NC}"
+    printf "%bPlease run tests from the project root directory.%b\n" "${YELLOW}" "${NC}"
+    exit 1
+fi
+
+# Check if we're on a proper Linux/WSL system
+if [[ ! -d "/proc" ]]; then
+    printf "%bWarning: /proc not found. Tests require Linux or WSL.%b\n" "${YELLOW}" "${NC}"
+fi
+
 # Function to run a single test file
 run_test_file() {
     local test_file=$1

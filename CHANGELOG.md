@@ -6,6 +6,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.2.0] - 2026-01-02
+
+### Fixed
+- **Signal decoding** — Correctly handles hex masks from /proc without 0x prefix
+- **Empty-data crash** — `debug_memory_leak.sh` now validates samples before analysis
+- **PID validation** — `find_fd_leak.sh` handles empty auto-selection gracefully
+- **Temp file cleanup** — `s9-fdmap` now properly cleans up temp files on exit/interrupt
+- **Percentage formatting** — Fixed regex pattern for decimal detection in comparisons
+- **Alert timing** — `debug_memory_leak.sh` alerts fire at correct intervals (10, 20, 30...)
+- **JSON sanitization** — Added handling for form feed, backspace, and control characters
+- **Path validation** — Uses `realpath` for proper symlink resolution and writability checks
+
+### Added
+- **Container detection** — Support for containerd, podman, and PID namespace detection
+- **Test runner checks** — Validates library and /proc availability before running tests
+- **Documentation** — Added missing `--quiet` and `--export` flags to USAGE.md
+
+### Changed
+- Architecture diagram now includes `s9-compare` tool
+- Improved namespace detection using PID namespace (most reliable indicator)
+
+---
+
 ## [Unreleased]
 
 ### Added
@@ -39,7 +62,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [1.0.0] - 2024-11-01
+## [1.0.0] - 2025-11-01
 
 Initial public release.
 
@@ -71,5 +94,6 @@ Initial public release.
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 1.2.0 | 2026-01-02 | Bug fixes, improved container detection, documentation |
 | 1.1.0 | 2025-12-05 | Process comparison, test improvements |
-| 1.0.0 | 2024-11-01 | Initial release with 5 core tools |
+| 1.0.0 | 2025-11-01 | Initial release with 5 core tools |

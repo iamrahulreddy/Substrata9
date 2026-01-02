@@ -166,12 +166,13 @@ while (( $(date +%s) < END_TIME )) && [[ "$INTERRUPTED" != "true" ]]; do
     printf "%s  RSS: ${rss_color}%8s KB${S9_NC} (%+d)  FDs: %d (%+d)\n" \
         "$TIMESTAMP" "$RSS" "$RSS_CHANGE" "$FDS" "$FD_CHANGE"
     
-    # Alert on significant growth
-    if (( RSS > 1000000 )) && (( SAMPLE_COUNT % 10 == 0 )); then
+    # Increment counter first, then check for alerts
+    ((SAMPLE_COUNT++))
+    
+    # Alert on significant growth (every 10 samples after the first)
+    if (( RSS > 1000000 )) && (( SAMPLE_COUNT > 1 )) && (( SAMPLE_COUNT % 10 == 0 )); then
         printf "  %b⚠ Memory exceeded 1GB%b\n" "${S9_YELLOW}" "${S9_NC}"
     fi
-    
-    ((SAMPLE_COUNT++))
     sleep "$INTERVAL"
 done
 
@@ -197,42 +198,52 @@ echo "Samples collected: $SAMPLE_COUNT"
 echo ""
 
 # Analyze the log
-if (( SAMPLE_COUNT > 1 )); then
-    FIRST_RSS=$(head -2 "$LOG_FILE" | tail -1 | cut -d, -f2)
-    LAST_RSS=$(tail -1 "$LOG_FILE" | cut -d, -f2)
-    GROWTH=$((LAST_RSS - FIRST_RSS))
+# Validate we have actual data rows (not just header)
+DATA_LINES=$(grep -cv "^Timestamp," "$LOG_FILE" 2>/dev/null || echo "0")
+if (( DATA_LINES < 1 )); then
+    printf "%b⚠ No data samples collected - analysis skipped%b\n" "${S9_YELLOW}" "${S9_NC}"
+elif (( SAMPLE_COUNT > 1 )); then
+    FIRST_RSS=$(grep -v "^Timestamp," "$LOG_FILE" | head -1 | cut -d, -f2)
+    LAST_RSS=$(grep -v "^Timestamp," "$LOG_FILE" | tail -1 | cut -d, -f2)
     
-    FIRST_FDS=$(head -2 "$LOG_FILE" | tail -1 | cut -d, -f5)
-    LAST_FDS=$(tail -1 "$LOG_FILE" | cut -d, -f5)
-    FD_GROWTH=$((LAST_FDS - FIRST_FDS))
-    
-    echo "Memory:"
-    echo "  Initial RSS: $FIRST_RSS KB"
-    echo "  Final RSS:   $LAST_RSS KB"
-    echo -n "  Growth:      $GROWTH KB "
-    
-    if (( GROWTH > 100000 )); then
-        printf "%b🔴 LEAK LIKELY: Grew >100MB%b\n" "${S9_RED}" "${S9_NC}"
-    elif (( GROWTH > 10000 )); then
-        printf "%b🟡 POSSIBLE LEAK: Grew >10MB%b\n" "${S9_YELLOW}" "${S9_NC}"
-    elif (( GROWTH > 1000 )); then
-        printf "%b🟡 Minor growth: >1MB%b\n" "${S9_YELLOW}" "${S9_NC}"
+    # Validate extracted values are numeric
+    if ! [[ "$FIRST_RSS" =~ ^[0-9]+$ ]] || ! [[ "$LAST_RSS" =~ ^[0-9]+$ ]]; then
+        printf "%b⚠ Invalid data in log file - analysis skipped%b\n" "${S9_YELLOW}" "${S9_NC}"
     else
-        printf "%b🟢 Normal variation%b\n" "${S9_GREEN}" "${S9_NC}"
-    fi
-    
-    echo ""
-    echo "File Descriptors:"
-    echo "  Initial: $FIRST_FDS"
-    echo "  Final:   $LAST_FDS"
-    echo -n "  Growth:  $FD_GROWTH "
-    
-    if (( FD_GROWTH > 100 )); then
-        printf "%b🔴 FD LEAK LIKELY%b\n" "${S9_RED}" "${S9_NC}"
-    elif (( FD_GROWTH > 10 )); then
-        printf "%b🟡 FD growth detected%b\n" "${S9_YELLOW}" "${S9_NC}"
-    else
-        printf "%b🟢 FD count stable%b\n" "${S9_GREEN}" "${S9_NC}"
+        GROWTH=$((LAST_RSS - FIRST_RSS))
+        
+        FIRST_FDS=$(grep -v "^Timestamp," "$LOG_FILE" | head -1 | cut -d, -f5)
+        LAST_FDS=$(grep -v "^Timestamp," "$LOG_FILE" | tail -1 | cut -d, -f5)
+        FD_GROWTH=$((LAST_FDS - FIRST_FDS))
+        
+        echo "Memory:"
+        echo "  Initial RSS: $FIRST_RSS KB"
+        echo "  Final RSS:   $LAST_RSS KB"
+        echo -n "  Growth:      $GROWTH KB "
+        
+        if (( GROWTH > 100000 )); then
+            printf "%b🔴 LEAK LIKELY: Grew >100MB%b\n" "${S9_RED}" "${S9_NC}"
+        elif (( GROWTH > 10000 )); then
+            printf "%b🟡 POSSIBLE LEAK: Grew >10MB%b\n" "${S9_YELLOW}" "${S9_NC}"
+        elif (( GROWTH > 1000 )); then
+            printf "%b🟡 Minor growth: >1MB%b\n" "${S9_YELLOW}" "${S9_NC}"
+        else
+            printf "%b🟢 Normal variation%b\n" "${S9_GREEN}" "${S9_NC}"
+        fi
+        
+        echo ""
+        echo "File Descriptors:"
+        echo "  Initial: $FIRST_FDS"
+        echo "  Final:   $LAST_FDS"
+        echo -n "  Growth:  $FD_GROWTH "
+        
+        if (( FD_GROWTH > 100 )); then
+            printf "%b🔴 FD LEAK LIKELY%b\n" "${S9_RED}" "${S9_NC}"
+        elif (( FD_GROWTH > 10 )); then
+            printf "%b🟡 FD growth detected%b\n" "${S9_YELLOW}" "${S9_NC}"
+        else
+            printf "%b🟢 FD count stable%b\n" "${S9_GREEN}" "${S9_NC}"
+        fi
     fi
 fi
 
