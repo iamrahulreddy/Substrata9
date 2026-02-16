@@ -39,6 +39,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 - Improved CRLF handling for cross-platform compatibility
 - Refined documentation with clearer explanations
+ - Marked bundled `bin/` scripts as executable so tools are
+	 runnable immediately after checkout (mode-only change; no code
+	 or behavior changes).
 
 ### Fixed
 - Truncated code block in USAGE.md
