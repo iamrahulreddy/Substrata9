@@ -1,16 +1,13 @@
 name: Substrata9 CI
-
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-
 jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,11 +25,7 @@ jobs:
       - name: Run ShellCheck (Errors Only)
         run: |
           echo "Running ShellCheck..."
-
-          # Only fail on real errors (--severity=error).
           shellcheck -x --severity=error bin/s9-* bin/bc lib/*.sh tests/*.sh examples/*.sh
-
-          # Additionally print all warnings/info without failing CI.
           echo "--- ShellCheck Warnings (non-fatal) ---"
           shellcheck -x bin/s9-* bin/bc lib/*.sh tests/*.sh examples/*.sh || true
 
@@ -42,7 +35,7 @@ jobs:
       - name: Verify Forced Color Rendering
         run: |
           echo "Checking forced ANSI color output..."
-          output="$(FORCE_COLOR=1 bash bin/s9-tree --help)"
+          output="$(script -qefc 'bash bin/s9-tree --help' /dev/null)"
           if printf '%s' "$output" | grep -q $'\033'; then
             echo "OK: forced color rendering check passed"
           else
