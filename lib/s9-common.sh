@@ -27,11 +27,16 @@ S9_VERSION="1.2.1"
 #------------------------------------------------------------------------------
 s9_should_use_color() {
     [[ -z "${NO_COLOR:-}" ]] || return 1
-    [[ "${TERM:-}" != "dumb" ]] || return 1
-    [[ -t 1 ]] && return 0
-    [[ -n "${FORCE_COLOR:-}" && "${FORCE_COLOR}" != "0" ]] && return 0
+
+    # Explicit force flags take priority over terminal checks
+    [[ -n "${FORCE_COLOR:-}"    && "${FORCE_COLOR}"    != "0" ]] && return 0
     [[ -n "${CLICOLOR_FORCE:-}" && "${CLICOLOR_FORCE}" != "0" ]] && return 0
     [[ -n "${S9_FORCE_COLOR:-}" && "${S9_FORCE_COLOR}" != "0" ]] && return 0
+
+    # Now check terminal environment
+    [[ "${TERM:-}" != "dumb" ]] || return 1
+    [[ -t 1 ]] && return 0
+
     return 1
 }
 
@@ -46,7 +51,6 @@ if s9_should_use_color; then
     export S9_DIM=$'\033[2m'
     export S9_NC=$'\033[0m'
 else
-    # No colors for non-interactive or dumb terminals unless explicitly forced.
     export S9_RED='' S9_GREEN='' S9_YELLOW='' S9_BLUE=''
     export S9_CYAN='' S9_MAGENTA='' S9_BOLD='' S9_DIM='' S9_NC=''
 fi
@@ -55,33 +59,27 @@ fi
 # Output Functions
 #------------------------------------------------------------------------------
 
-# Print error and exit
 s9_die() {
     printf "%bError:%b %s\n" "${S9_RED}" "${S9_NC}" "$1" >&2
     exit "${2:-1}"
 }
 
-# Print info message
 s9_info() {
     printf "%b►%b %s\n" "${S9_CYAN}" "${S9_NC}" "$1"
 }
 
-# Print success message
 s9_success() {
     printf "%b✓%b %s\n" "${S9_GREEN}" "${S9_NC}" "$1"
 }
 
-# Print warning
 s9_warn() {
     printf "%bWarning:%b %s\n" "${S9_YELLOW}" "${S9_NC}" "$1" >&2
 }
 
-# Print debug (only if S9_DEBUG is set)
 s9_debug() {
     [[ -n "${S9_DEBUG:-}" ]] && printf "%b[DEBUG] %s%b\n" "${S9_DIM}" "$1" "${S9_NC}" >&2
 }
 
-# Print section header with visual separation
 s9_header() {
     local title="$1"
     local width=66
@@ -95,25 +93,20 @@ s9_header() {
     echo ""
 }
 
-# Print sub-header with underline
 s9_subheader() {
     echo ""
     printf "%b%s%b\n" "${S9_BOLD}" "$1" "${S9_NC}"
     printf "%b%s%b\n" "${S9_DIM}" "$(printf '─%.0s' $(seq 1 ${#1}))" "${S9_NC}"
 }
 
-# Print section separator (blank line)
 s9_separator() {
     echo ""
 }
 
-# Print a horizontal rule
 s9_rule() {
     printf "%b────────────────────────────────────────────────────────────────%b\n" "${S9_DIM}" "${S9_NC}"
 }
 
-# Print a key-value pair with aligned formatting
-# Usage: s9_kv "Label" "Value" [width] [color]
 s9_kv() {
     local label="$1"
     local value="$2"
@@ -127,8 +120,6 @@ s9_kv() {
     fi
 }
 
-# Print a status indicator
-# Usage: s9_status "ok|warn|error|info" "message"
 s9_status() {
     local type="$1"
     local msg="$2"
@@ -152,8 +143,6 @@ s9_status() {
     esac
 }
 
-# Print a progress/metric bar
-# Usage: s9_bar "label" current max [width]
 s9_bar() {
     local label="$1"
     local current="$2"
@@ -185,19 +174,17 @@ s9_bar() {
     printf "  %-12s [%s] %3d%%\n" "$label" "$bar" "$percent"
 }
 
-# Print boxed title (for main headers)
 s9_box_title() {
     local title="$1"
     local subtitle="${2:-}"
     local width=68
-    local inner_width=$((width - 2))  # Account for left padding "  "
+    local inner_width=$((width - 2))
 
     echo ""
     printf "%b╔" "${S9_BOLD}"
     printf '═%.0s' $(seq 1 $width)
     printf "╗%b\n" "${S9_NC}"
 
-    # Calculate padding needed for title
     local title_len=${#title}
     local title_pad=$((inner_width - title_len))
     printf "%b║%b  %s%*s%b║%b\n" "${S9_BOLD}" "${S9_CYAN}" "$title" "$title_pad" "" "${S9_BOLD}" "${S9_NC}"
@@ -218,27 +205,18 @@ s9_box_title() {
 # JSON Helper Functions
 #------------------------------------------------------------------------------
 
-# Sanitize string for JSON (escape quotes and backslashes)
 s9_sanitize_json() {
     local input="$1"
-    # Escape backslash first, then double quotes, then control characters
-    # This handles the most common cases that could break JSON parsing
-    input="${input//\\/\\\\}"      # Backslash
-    input="${input//\"/\\\"}"      # Double quote
-    input="${input//$'\n'/\\n}"    # Newline
-    input="${input//$'\r'/\\r}"    # Carriage return
-    input="${input//$'\t'/\\t}"    # Tab
-    input="${input//$'\f'/\\f}"    # Form feed
-    input="${input//$'\b'/\\b}"    # Backspace
-    # Remove any remaining control characters (0x00-0x1F except those already escaped)
-    # Using tr to strip them as bash parameter expansion can't handle null bytes
+    input="${input//\\/\\\\}"
+    input="${input//\"/\\\"}"
+    input="${input//$'\n'/\\n}"
+    input="${input//$'\r'/\\r}"
+    input="${input//$'\t'/\\t}"
+    input="${input//$'\f'/\\f}"
+    input="${input//$'\b'/\\b}"
     echo "$input" | tr -d '\000-\007\013\016-\037'
 }
 
-# Output JSON key-value pair
-# Usage: s9_json_kv "key" "value" [last] [indent]
-# If 'last' is set to "last", no trailing comma is added
-# 'indent' is an optional prefix for additional indentation (e.g., "    " for nested objects)
 s9_json_kv() {
     local key="$1"
     local val="$2"
@@ -246,7 +224,6 @@ s9_json_kv() {
     local indent="${4:-}"
     local sanitized_val
 
-    # Check if value looks like a number or boolean or null, otherwise quote it
     if [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || [[ "$val" == "true" ]] || [[ "$val" == "false" ]] || [[ "$val" == "null" ]]; then
         sanitized_val="$val"
     else
@@ -264,11 +241,9 @@ s9_json_kv() {
 # Formatting Functions
 #------------------------------------------------------------------------------
 
-# Convert bytes to human readable
 s9_human_bytes() {
     local bytes=${1:-0}
 
-    # Validate input is numeric
     if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
         echo "0 B"
         return
@@ -285,18 +260,15 @@ s9_human_bytes() {
     fi
 }
 
-# Convert kB to human readable
 s9_human_kb() {
     local kb=${1:-0}
     [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
     s9_human_bytes $((kb * 1024))
 }
 
-# Format duration in seconds to human readable
 s9_human_duration() {
     local seconds=${1:-0}
 
-    # Handle negative values (can occur with clock adjustments)
     (( seconds < 0 )) && seconds=0
 
     local days=$((seconds / 86400))
@@ -319,35 +291,30 @@ s9_human_duration() {
 # Validation Functions
 #------------------------------------------------------------------------------
 
-# Check if running as root
 s9_require_root() {
     if [[ $EUID -ne 0 ]]; then
         s9_die "This operation requires root privileges. Try: sudo $0 $*"
     fi
 }
 
-# Check bash version (require 4.0+)
 s9_check_bash_version() {
     if (( BASH_VERSINFO[0] < 4 )); then
         s9_die "This script requires bash 4.0 or later (found $BASH_VERSION)"
     fi
 }
 
-# Check if on Linux
 s9_check_linux() {
     if [[ "$(uname -s)" != "Linux" ]]; then
         s9_die "This tool only works on Linux (detected: $(uname -s))"
     fi
 }
 
-# Check if /proc exists
 s9_check_proc() {
     if [[ ! -d "/proc" ]]; then
         s9_die "/proc filesystem not found. Is this a Linux system?"
     fi
 }
 
-# Return an executable bc path, if one is available.
 s9_find_bc() {
     local bc_path
     bc_path=$(command -v bc 2>/dev/null || true)
@@ -358,7 +325,6 @@ s9_find_bc() {
     return 1
 }
 
-# Check if bc is available.
 s9_check_bc() {
     if s9_find_bc >/dev/null; then
         return 0
@@ -372,7 +338,6 @@ s9_check_bc() {
     s9_die "bc is required but not installed. Install with: sudo apt install bc"
 }
 
-# Run a calculation through system bc or the bundled fallback.
 s9_calc() {
     local bc_path
     if bc_path=$(s9_find_bc); then
@@ -388,7 +353,6 @@ s9_calc() {
     s9_die "bc is required but not installed. Install with: sudo apt install bc"
 }
 
-# Run all standard checks
 s9_init() {
     s9_check_bash_version
     s9_check_linux
@@ -400,24 +364,20 @@ s9_init() {
 # Process Functions
 #------------------------------------------------------------------------------
 
-# Check if process exists
 s9_process_exists() {
     [[ -d "/proc/$1" ]]
 }
 
-# Get process name (comm) - sanitized for safe display
 s9_get_comm() {
     local name
     name=$(s9_read_proc_file "/proc/$1/comm") || name="unknown"
     s9_sanitize_display "$name"
 }
 
-# Get process state
 s9_get_state() {
     awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null
 }
 
-# Get process state with description
 s9_get_state_desc() {
     local state
     state=$(s9_get_state "$1")
@@ -433,37 +393,30 @@ s9_get_state_desc() {
     esac
 }
 
-# Get parent PID
 s9_get_ppid() {
     awk '/^PPid:/ {print $2}' "/proc/$1/status" 2>/dev/null
 }
 
-# Get process RSS in kB
 s9_get_rss() {
     awk '/^VmRSS:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "0"
 }
 
-# Get process VmSize in kB
 s9_get_vmsize() {
     awk '/^VmSize:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "0"
 }
 
-# Get thread count
 s9_get_threads() {
     awk '/^Threads:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "1"
 }
 
-# Get UID of process
 s9_get_uid() {
     awk '/^Uid:/ {print $2}' "/proc/$1/status" 2>/dev/null
 }
 
-# Get username from UID
 s9_uid_to_user() {
     getent passwd "$1" 2>/dev/null | cut -d: -f1 || echo "$1"
 }
 
-# Get FD count for process
 s9_get_fd_count() {
     local pid=$1
     if [[ -r "/proc/$pid/fd" ]]; then
@@ -473,9 +426,6 @@ s9_get_fd_count() {
     fi
 }
 
-# Get a numeric field from /proc/[pid]/stat safely. Field 2 (comm) is wrapped
-# in parentheses and can contain spaces, so simple awk field numbers can drift.
-# Usage: s9_get_stat_field <pid> <field_number>
 s9_get_stat_field() {
     local pid="$1"
     local field_number="$2"
@@ -494,61 +444,49 @@ s9_get_stat_field() {
     echo "${fields[$idx]}"
 }
 
-# Check if process is in a container/namespace
 s9_check_namespace() {
     local pid=$1
 
-    # Look for container fingerprints in cgroup (handles both v1 and v2)
     if [[ -f "/proc/$pid/cgroup" ]]; then
         local cgroup_content
         cgroup_content=$(cat "/proc/$pid/cgroup" 2>/dev/null) || cgroup_content=""
 
         if [[ "$cgroup_content" == *"docker"* ]]; then
-            echo "docker"
-            return 0
+            echo "docker"; return 0
         elif [[ "$cgroup_content" == *"containerd"* ]]; then
-            echo "containerd"
-            return 0
+            echo "containerd"; return 0
         elif [[ "$cgroup_content" == *"lxc"* ]]; then
-            echo "lxc"
-            return 0
+            echo "lxc"; return 0
         elif [[ "$cgroup_content" == *"kubepods"* ]] || [[ "$cgroup_content" == *"kubelet"* ]]; then
-            echo "k8s"
-            return 0
+            echo "k8s"; return 0
         elif [[ "$cgroup_content" == *"podman"* ]]; then
-            echo "podman"
-            return 0
+            echo "podman"; return 0
         fi
     fi
 
-    # Check PID namespace (most reliable indicator of containerization)
     if [[ -r "/proc/$pid/ns/pid" ]] && [[ -r "/proc/1/ns/pid" ]]; then
         local pid_ns init_ns
         pid_ns=$(readlink "/proc/$pid/ns/pid" 2>/dev/null || echo "")
         init_ns=$(readlink "/proc/1/ns/pid" 2>/dev/null || echo "")
 
         if [[ -n "$pid_ns" ]] && [[ -n "$init_ns" ]] && [[ "$pid_ns" != "$init_ns" ]]; then
-            echo "namespace"
-            return 0
+            echo "namespace"; return 0
         fi
     fi
 
-    # Last resort: check mount namespace
     if [[ -r "/proc/$pid/ns/mnt" ]] && [[ -r "/proc/1/ns/mnt" ]]; then
         local mnt_ns init_mnt_ns
         mnt_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "")
         init_mnt_ns=$(readlink "/proc/1/ns/mnt" 2>/dev/null || echo "")
 
         if [[ -n "$mnt_ns" ]] && [[ -n "$init_mnt_ns" ]] && [[ "$mnt_ns" != "$init_mnt_ns" ]]; then
-            echo "namespace"
-            return 0
+            echo "namespace"; return 0
         fi
     fi
 
     echo ""
 }
 
-# Validate numeric input
 s9_validate_number() {
     local value="$1"
     local name="${2:-value}"
@@ -557,22 +495,16 @@ s9_validate_number() {
     fi
 }
 
-# Sanitize string for use in filenames
 s9_sanitize_filename() {
     local input="$1"
-    # Only allow alphanumeric, dash, underscore
     echo "${input//[^a-zA-Z0-9_-]/}"
 }
 
-# Sanitize string for safe terminal display (strip ANSI escape sequences)
 s9_sanitize_display() {
     local input="$1"
-    # Remove ANSI escape sequences and control characters
     echo "$input" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\000-\011\013-\037'
 }
 
-# Read /proc file with timeout to handle D-state processes
-# Usage: s9_read_proc_file <file_path> [timeout_seconds]
 s9_read_proc_file() {
     local file="$1"
     local timeout_sec="${2:-2}"
@@ -580,12 +512,10 @@ s9_read_proc_file() {
     if command -v timeout &>/dev/null; then
         timeout "$timeout_sec" cat "$file" 2>/dev/null
     else
-        # Fallback if timeout command not available
         cat "$file" 2>/dev/null
     fi
 }
 
-# Validate port number (1-65535)
 s9_validate_port() {
     local port="$1"
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
@@ -593,24 +523,18 @@ s9_validate_port() {
     fi
 }
 
-# Validate directory path is safe (under home or /tmp)
 s9_validate_safe_dir() {
     local dir="$1"
     local resolved
 
-    # Resolve to absolute path, following symlinks
     if command -v realpath &>/dev/null; then
         resolved=$(realpath -m "$dir" 2>/dev/null) || resolved=""
     else
-        # Fallback: try cd + pwd
         resolved=$(cd "$dir" 2>/dev/null && pwd -P) || resolved=""
     fi
 
-    # If resolution failed, use the original path
     [[ -z "$resolved" ]] && resolved="$dir"
 
-    # Check if under HOME or /tmp. Match path boundaries so /home/user2 is
-    # not treated as being under /home/user.
     local home_dir="${HOME:-}"
     local under_home=false
     local under_tmp=false
@@ -627,7 +551,6 @@ s9_validate_safe_dir() {
         return 1
     fi
 
-    # Check if writable (if it exists)
     if [[ -d "$resolved" ]] && [[ ! -w "$resolved" ]]; then
         s9_warn "Directory '$resolved' is not writable"
         return 1
@@ -636,19 +559,16 @@ s9_validate_safe_dir() {
     return 0
 }
 
-# Resolve PID from name or validate existing PID
 s9_resolve_pid() {
     local input="$1"
     local quiet="${2:-false}"
 
-    # Sanitize input - only allow alphanumeric, dash, underscore, dot
     local sanitized="${input//[^a-zA-Z0-9_.-]/}"
     if [[ "$sanitized" != "$input" ]]; then
         [[ "$quiet" != "true" ]] && s9_warn "Invalid characters in process identifier"
         return 1
     fi
 
-    # If it's already a number, validate it exists
     if [[ "$input" =~ ^[0-9]+$ ]]; then
         if s9_process_exists "$input"; then
             echo "$input"
@@ -659,7 +579,6 @@ s9_resolve_pid() {
         fi
     fi
 
-    # Search by exact name first, then partial match
     local pids
     pids=$(pgrep -x -- "$input" 2>/dev/null) || pids=$(pgrep -- "$input" 2>/dev/null) || true
 
@@ -689,42 +608,24 @@ s9_resolve_pid() {
 # Comparison Display Functions
 #------------------------------------------------------------------------------
 
-# Get difference indicator with arrow and color
-# Usage: s9_diff_indicator <diff_value> [reverse]
-# If reverse is set, negative is good (e.g., memory decrease)
 s9_diff_indicator() {
     local diff=$1
     local reverse="${2:-}"
     local arrow color sign
 
     if (( diff > 0 )); then
-        arrow="↑"
-        sign="+"
-        if [[ -n "$reverse" ]]; then
-            color="$S9_RED"
-        else
-            color="$S9_GREEN"
-        fi
+        arrow="↑"; sign="+"
+        color=$( [[ -n "$reverse" ]] && echo "$S9_RED" || echo "$S9_GREEN" )
     elif (( diff < 0 )); then
-        arrow="↓"
-        sign=""
-        if [[ -n "$reverse" ]]; then
-            color="$S9_GREEN"
-        else
-            color="$S9_RED"
-        fi
+        arrow="↓"; sign=""
+        color=$( [[ -n "$reverse" ]] && echo "$S9_GREEN" || echo "$S9_RED" )
     else
-        arrow="→"
-        sign=""
-        color="$S9_DIM"
+        arrow="→"; sign=""; color="$S9_DIM"
     fi
 
     printf "%b%s %s%d%b" "$color" "$arrow" "$sign" "$diff" "$S9_NC"
 }
 
-# Print a comparison row with before/after values
-# Usage: s9_compare_row <label> <val1> <val2> <unit> [human_func]
-# human_func can be "kb" or "bytes" for automatic human-readable conversion
 s9_compare_row() {
     local label="$1"
     local val1="${2:-0}"
@@ -732,18 +633,15 @@ s9_compare_row() {
     local unit="${4:-}"
     local human_func="${5:-}"
 
-    # Ensure numeric values
     [[ "$val1" =~ ^-?[0-9]+$ ]] || val1=0
     [[ "$val2" =~ ^-?[0-9]+$ ]] || val2=0
 
     local diff=$((val2 - val1))
-    local abs_diff=${diff#-}  # Absolute value for display
+    local abs_diff=${diff#-}
     local percent="—"
 
     if (( val1 > 0 )); then
-        # Calculate percentage and ensure proper formatting (add leading zero if needed)
         percent=$(echo "scale=1; ($diff * 100) / $val1" | s9_calc 2>/dev/null || echo "0")
-        # Fix leading zero for decimals like -.1 → -0.1 or .5 → 0.5
         if [[ "$percent" =~ ^\\. ]]; then
             percent="0$percent"
         elif [[ "$percent" =~ ^-\\. ]]; then
@@ -754,8 +652,6 @@ s9_compare_row() {
         percent="new"
     fi
 
-    # Format values with human-readable versions if requested
-    # Always use absolute value for diff display (arrow indicates direction)
     local display1="$val1" display2="$val2" diff_display
     if [[ "$human_func" == "kb" ]]; then
         display1=$(s9_human_kb "$val1")
@@ -771,25 +667,19 @@ s9_compare_row() {
         diff_display="$abs_diff $unit"
     fi
 
-    # Color and arrow for change direction
     local change_color="$S9_DIM"
     local arrow="→"
     local sign=""
     if (( diff > 0 )); then
-        change_color="$S9_RED"
-        arrow="↑"
-        sign="+"
+        change_color="$S9_RED"; arrow="↑"; sign="+"
     elif (( diff < 0 )); then
-        change_color="$S9_GREEN"
-        arrow="↓"
-        sign="-"
+        change_color="$S9_GREEN"; arrow="↓"; sign="-"
     fi
 
     printf "  ${S9_BOLD}%-16s${S9_NC} %-14s  %-14s  %b%s %s%-10s (%s)%b\n" \
         "$label" "$display1" "$display2" "$change_color" "$arrow" "$sign" "$diff_display" "$percent" "$S9_NC"
 }
 
-# Print comparison table header
 s9_compare_header() {
     local col1="${1:-Before}"
     local col2="${2:-After}"
@@ -801,35 +691,29 @@ s9_compare_header() {
 # Signal Handling
 #------------------------------------------------------------------------------
 
-# Signal name lookup table
 declare -gA S9_SIGNALS=(
-    [1]="SIGHUP" [2]="SIGINT" [3]="SIGQUIT" [4]="SIGILL"
-    [5]="SIGTRAP" [6]="SIGABRT" [7]="SIGBUS" [8]="SIGFPE"
-    [9]="SIGKILL" [10]="SIGUSR1" [11]="SIGSEGV" [12]="SIGUSR2"
+    [1]="SIGHUP"  [2]="SIGINT"    [3]="SIGQUIT"  [4]="SIGILL"
+    [5]="SIGTRAP" [6]="SIGABRT"   [7]="SIGBUS"   [8]="SIGFPE"
+    [9]="SIGKILL" [10]="SIGUSR1"  [11]="SIGSEGV" [12]="SIGUSR2"
     [13]="SIGPIPE" [14]="SIGALRM" [15]="SIGTERM" [16]="SIGSTKFLT"
     [17]="SIGCHLD" [18]="SIGCONT" [19]="SIGSTOP" [20]="SIGTSTP"
-    [21]="SIGTTIN" [22]="SIGTTOU" [23]="SIGURG" [24]="SIGXCPU"
+    [21]="SIGTTIN" [22]="SIGTTOU" [23]="SIGURG"  [24]="SIGXCPU"
     [25]="SIGXFSZ" [26]="SIGVTALRM" [27]="SIGPROF" [28]="SIGWINCH"
-    [29]="SIGIO" [30]="SIGPWR" [31]="SIGSYS"
+    [29]="SIGIO"  [30]="SIGPWR"   [31]="SIGSYS"
 )
 
-# Decode signal mask (hex) to signal names
 s9_decode_signals() {
     local mask=${1:-0}
     local result=""
 
-    # Handle empty or all-zeros mask
     if [[ -z "$mask" ]] || [[ "$mask" =~ ^0+$ ]]; then
         echo "none"
         return
     fi
 
-    # Convert hex to decimal safely
-    # /proc outputs hex without 0x prefix, so strip it if present and normalize
     local num
-    mask="${mask#0x}"  # Strip 0x prefix if present
-    mask="${mask#0X}"  # Also handle uppercase
-    # Handle large hex values by taking only the last 8 characters (32 signals max)
+    mask="${mask#0x}"
+    mask="${mask#0X}"
     [[ ${#mask} -gt 8 ]] && mask="${mask: -8}"
     num=$((16#$mask)) 2>/dev/null || num=0
 
@@ -846,22 +730,18 @@ s9_decode_signals() {
 # System Information
 #------------------------------------------------------------------------------
 
-# Get total system memory in kB
 s9_get_total_mem() {
     awk '/^MemTotal:/ {print $2}' /proc/meminfo
 }
 
-# Get available system memory in kB
 s9_get_avail_mem() {
     awk '/^MemAvailable:/ {print $2}' /proc/meminfo
 }
 
-# Get system uptime in seconds
 s9_get_uptime() {
     awk '{print int($1)}' /proc/uptime
 }
 
-# Get kernel version
 s9_get_kernel() {
     uname -r
 }

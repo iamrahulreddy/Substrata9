@@ -35,7 +35,7 @@ jobs:
       - name: Verify Forced Color Rendering
         run: |
           echo "Checking forced ANSI color output..."
-          output="$(script -qefc 'bash bin/s9-tree --help' /dev/null)"
+          output="$(FORCE_COLOR=1 bash bin/s9-tree --help)"
           if printf '%s' "$output" | grep -q $'\033'; then
             echo "OK: forced color rendering check passed"
           else
