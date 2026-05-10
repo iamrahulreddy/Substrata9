@@ -7,9 +7,6 @@ DOCDIR = $(PREFIX)/share/doc/substrata9
 
 SCRIPTS = $(wildcard bin/s9-*)
 
-# Ensure local `bin/` is preferred when running make recipes so a repo-local
-# `bin/bc` fallback can be used during development if system `bc` is missing.
-export PATH := $(CURDIR)/bin:$(PATH)
 # Version is sourced from lib/s9-common.sh as single source of truth
 VERSION = $(shell grep 'S9_VERSION=' lib/s9-common.sh | cut -d'"' -f2)
 
@@ -24,7 +21,7 @@ help:
 	@echo "Targets:"
 	@echo "  install      Install to $(PREFIX)"
 	@echo "  uninstall    Remove installation"
-	@echo "  test         Run basic tests"
+	@echo "  test         Run full test suite"
 	@echo "  lint         Run shellcheck on all scripts"
 	@echo "  check-deps   Check for required dependencies"
 	@echo "  clean        Clean build artifacts"
@@ -49,13 +46,14 @@ check-deps:
 	@echo "✓ grep found"
 	@command -v sed >/dev/null 2>&1 || { echo "❌ sed not found"; exit 1; }
 	@echo "✓ sed found"
-	@command -v bc >/dev/null 2>&1 || { \
-		if [ -x "$(CURDIR)/bin/bc" ]; then \
-			echo "⚠ bc not found; using local fallback: $(CURDIR)/bin/bc"; \
+	@bc_path="$$(command -v bc 2>/dev/null || true)"; \
+	if [ -z "$$bc_path" ] || [ ! -x "$$bc_path" ]; then \
+		if [ -f "$(CURDIR)/bin/bc" ]; then \
+			echo "⚠ bc not found; using local fallback via bash: $(CURDIR)/bin/bc"; \
 		else \
 			echo "❌ bc not found - install with: sudo apt install bc"; exit 1; \
-		fi \
-	}
+		fi; \
+	fi
 	@echo "✓ bc available"
 	@echo ""
 	@echo "All dependencies satisfied!"
@@ -97,30 +95,7 @@ uninstall:
 	@echo "✓ Uninstall complete."
 
 test:
-	@echo "Running basic tests..."
-	@echo ""
-	@# Syntax check
-	@echo "1. Syntax check..."
-	@for script in bin/s9-* lib/*.sh; do \
-		bash -n "$$script" || exit 1; \
-	done
-	@echo "   ✓ All scripts pass syntax check"
-	@echo ""
-	@# Help flags
-	@echo "2. Testing --help flags..."
-	@for script in bin/s9-*; do \
-		"$$script" --help >/dev/null 2>&1 || { echo "   ❌ $$script --help failed"; exit 1; }; \
-	done
-	@echo "   ✓ All --help flags work"
-	@echo ""
-	@# Basic functionality
-	@echo "3. Testing basic functionality..."
-	@./bin/s9-inspect $$$$ >/dev/null 2>&1 && echo "   ✓ s9-inspect works"
-	@./bin/s9-tree --depth 1 >/dev/null 2>&1 && echo "   ✓ s9-tree works"
-	@./bin/s9-fdmap --top 5 >/dev/null 2>&1 && echo "   ✓ s9-fdmap works"
-	@./bin/s9-anomaly >/dev/null 2>&1 && echo "   ✓ s9-anomaly works"
-	@echo ""
-	@echo "All tests passed!"
+	@bash tests/run_tests.sh
 
 lint:
 	@echo "Running shellcheck..."

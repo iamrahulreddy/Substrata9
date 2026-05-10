@@ -1,8 +1,13 @@
 # Git attributes for cross-platform compatibility
 # Ensures consistent line endings for shell scripts
 
-# Shell scripts must use LF line endings
+# Shell scripts must use LF line endings.
+# Most executable tools in this repo are extensionless Bash scripts.
 *.sh text eol=lf
+/bin/* text eol=lf
+Makefile text eol=lf
+.github/**/*.yml text eol=lf
+.github/**/*.md text eol=lf
 
 # Batch scripts use CRLF (Windows)
 *.bat text eol=crlf

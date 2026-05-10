@@ -74,7 +74,7 @@ Utilize the provided helper functions in `lib/s9-common.sh` for consistency:
 
 All contributions must pass the automated test suite.
 
-*   **Run all tests:** `make test`
+*   **Run all tests:** `make test` (wraps `tests/run_tests.sh`)
 *   **Run specific tool test:** `./tests/test_tools.sh`
 *   **Linting:** `make lint`
 

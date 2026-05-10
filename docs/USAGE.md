@@ -13,7 +13,7 @@ Requirements:
 | **Operating System** | Linux (Kernel 4.15+, ideally 5.4+) |
 | **Shell** | Bash 4.0 or newer |
 | **Privileges** | Root/sudo recommended for full visibility into all processes |
-| **Dependencies** | `awk`, `sed`, `grep`, `bc` — standard on most systems |
+| **Dependencies** | `awk`, `sed`, `grep`; `bc` or the bundled lightweight fallback in `bin/bc` |
 
 > **Note:** Many `/proc` files require root access. Run with `sudo` for complete visibility.
 
@@ -111,6 +111,8 @@ s9-tree [options]
 | `--no-state` | Hide process state indicators |
 | `--json` | Output as JSON |
 
+> Note: `--user` currently applies to text output only. For JSON workflows, emit the full tree and filter it with `jq`.
+
 
 ### Process State Codes
 
@@ -182,7 +184,7 @@ s9-fdmap [options]
 | Option | What It Does |
 |--------|--------------|
 | `--file <PATH>` | Find which processes have this file open |
-| `--socket <PORT>` | Find which processes are using this port |
+| `--socket <PORT>` | Find which processes are using this TCP/UDP port, including IPv6 sockets |
 | `--leaks` | Scan for processes with suspiciously high FD counts |
 | `--threshold <N>` | FD count threshold for leak detection (default: 100) |
 | `--top <N>` | Show top N processes by FD count (default: 20) |
@@ -317,6 +319,42 @@ Metrics compared:
 | Variable | What It Does |
 |----------|--------------|
 | `S9_SNAPSHOT_DIR` | Override where snapshots are stored (default: `~/.substrata9/snapshots`) |
+
+## s9-compare — Live Process Comparison
+
+**Function:** Captures temporary snapshots of two live processes and compares their resource usage.
+
+**Use case:** Comparing workers, replicas, or parent/child processes without keeping snapshots on disk afterward.
+
+
+### Syntax
+
+```bash
+s9-compare <PID1 | process_name1> <PID2 | process_name2> [options]
+```
+
+
+### Options
+
+| Option | What It Does |
+|--------|--------------|
+| `--json` | Output the comparison as JSON |
+| `-h, --help` | Show help message |
+| `-v, --version` | Show version |
+
+
+### Examples
+
+```bash
+# Compare two known PIDs
+s9-compare 1234 5678
+
+# Compare newest and oldest nginx worker
+s9-compare $(pgrep -n nginx) $(pgrep -o nginx)
+
+# Machine-readable comparison
+s9-compare 1234 5678 --json | jq '.assessment'
+```
 
 ## s9-anomaly — System Health Scanner
 

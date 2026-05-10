@@ -25,11 +25,11 @@ run_tool() {
     local tool="$1"
     local args="$2"
     local desc="$3"
-    
+
     echo -n "    $tool $args ($desc)... "
     ((TESTS_RUN++))
-    
-    if "$BIN_DIR/$tool" $args >/dev/null 2>&1; then
+
+    if bash "$BIN_DIR/$tool" $args >/dev/null 2>&1; then
         echo "OK"
         ((TESTS_PASSED++))
         return 0
@@ -45,11 +45,11 @@ expect_fail() {
     local tool="$1"
     local args="$2"
     local desc="$3"
-    
+
     echo -n "    $tool $args ($desc)... "
     ((TESTS_RUN++))
-    
-    if ! "$BIN_DIR/$tool" $args >/dev/null 2>&1; then
+
+    if ! bash "$BIN_DIR/$tool" $args >/dev/null 2>&1; then
         echo "OK (expected failure)"
         ((TESTS_PASSED++))
         return 0
@@ -102,6 +102,9 @@ run_tool "s9-tree" "--json -d 1" "JSON output"
 
 # Error handling
 expect_fail "s9-tree" "--pid 999999999" "Non-existent root PID"
+expect_fail "s9-tree" "--json --user nobody" "JSON user filter unsupported"
+expect_fail "s9-tree" "--pid" "Missing PID value"
+expect_fail "s9-tree" "--depth" "Missing depth value"
 
 # =============================================================================
 # Test 4: s9-fdmap
@@ -112,6 +115,9 @@ run_tool "s9-fdmap" "--quiet" "Quiet mode"
 run_tool "s9-fdmap" "--leaks" "Leak detection"
 run_tool "s9-fdmap" "--leaks --threshold 1000" "Custom threshold"
 run_tool "s9-fdmap" "--json" "JSON output"
+expect_fail "s9-fdmap" "--top" "Missing top value"
+expect_fail "s9-fdmap" "--threshold" "Missing threshold value"
+expect_fail "s9-fdmap" "--socket" "Missing socket value"
 
 # Test file finding
 tmp_file=$(mktemp)
@@ -135,7 +141,7 @@ run_tool "s9-snapshot" "capture $TEST_PID --name $snap_name" "Capture snapshot"
 # Verify snapshot was created
 echo -n "    Snapshot verification... "
 ((TESTS_RUN++))
-if "$BIN_DIR/s9-snapshot" list 2>/dev/null | grep -q "$snap_name"; then
+if bash "$BIN_DIR/s9-snapshot" list 2>/dev/null | grep -q "$snap_name"; then
     echo "OK"
     ((TESTS_PASSED++))
 else
@@ -151,6 +157,7 @@ run_tool "s9-snapshot" "delete $snap_name --force" "Delete snapshot"
 
 # Error handling
 expect_fail "s9-snapshot" "capture 999999999 --name test" "Capture non-existent PID"
+expect_fail "s9-snapshot" "capture $TEST_PID --name" "Missing snapshot name value"
 expect_fail "s9-snapshot" "diff nonexistent1 nonexistent2" "Diff non-existent snapshots"
 
 # =============================================================================
@@ -166,6 +173,8 @@ run_tool "s9-anomaly" "--orphans" "Check orphans only"
 run_tool "s9-anomaly" "--mem-threshold 99" "Custom memory threshold"
 run_tool "s9-anomaly" "--fd-threshold 10000" "Custom FD threshold"
 run_tool "s9-anomaly" "--json" "JSON output"
+expect_fail "s9-anomaly" "--mem-threshold" "Missing memory threshold"
+expect_fail "s9-anomaly" "--fd-threshold" "Missing FD threshold"
 
 # =============================================================================
 # Test 7: s9-compare

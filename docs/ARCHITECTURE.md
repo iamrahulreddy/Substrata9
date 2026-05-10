@@ -61,10 +61,10 @@ Every tool loads it at startup:
 ```bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/s9-common.sh"
-s9_init  # Validates environment, sets up colors
+s9_init  # Validates the runtime environment before Linux/proc work
 ```
 
-Here's what the library handles:
+Tools handle cheap flags such as `--help` and `--version` before calling `s9_init`, so users can read usage text without needing Linux `/proc` access or every runtime dependency available. Here's what the library handles:
 
 | Category | Functions | What They Do |
 |----------|-----------|--------------|

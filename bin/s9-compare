@@ -20,9 +20,6 @@ source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
-# Run initialization checks
-s9_init
-
 #------------------------------------------------------------------------------
 # Main
 #------------------------------------------------------------------------------
@@ -57,7 +54,7 @@ main() {
     local pid1=""
     local pid2=""
     local json_mode=false
-    
+
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -87,27 +84,30 @@ main() {
                 ;;
         esac
     done
-    
+
     [[ -n "$pid1" ]] && [[ -n "$pid2" ]] || usage
-    
+
+    # Run environment checks after handling cheap flags like --help/--version.
+    s9_init
+
     # Resolve PIDs
     pid1=$(s9_resolve_pid "$pid1") || exit 1
     pid2=$(s9_resolve_pid "$pid2") || exit 1
-    
+
     if [[ "$pid1" == "$pid2" ]]; then
         s9_warn "Comparing process $pid1 to itself..."
     fi
-    
+
     # Create temp directory for snapshots
     local temp_dir
     temp_dir=$(mktemp -d) || s9_die "Cannot create temp directory"
-    
+
     # Ensure cleanup on exit
     trap "rm -rf '$temp_dir'" EXIT
-    
+
     # Export S9_SNAPSHOT_DIR to override s9-snapshot location
     export S9_SNAPSHOT_DIR="$temp_dir"
-    
+
     # Capture snapshots
     if ! $json_mode; then
         local name1 name2
@@ -118,24 +118,29 @@ main() {
             "${S9_CYAN}" "$pid1" "${S9_NC}" "$name1" \
             "${S9_CYAN}" "$pid2" "${S9_NC}" "$name2"
     fi
-    
-    # We need to call s9-snapshot. Assuming it's in the same dir as this script.
+
+    # Use the sibling snapshot tool, even if Git did not preserve executable bits.
     local snapshot_tool="$SCRIPT_DIR/s9-snapshot"
-    if [[ ! -x "$snapshot_tool" ]]; then
+    local -a snapshot_cmd
+    if [[ -x "$snapshot_tool" ]]; then
+        snapshot_cmd=("$snapshot_tool")
+    elif [[ -f "$snapshot_tool" ]]; then
+        snapshot_cmd=(bash "$snapshot_tool")
+    else
         s9_die "Cannot find s9-snapshot tool at $snapshot_tool"
     fi
-    
+
     # Capture PID1
-    local json_flag=""
-    $json_mode && json_flag="--json"
-    
-    "$snapshot_tool" capture "$pid1" --name "proc1" $json_flag >/dev/null
-    
+    local -a json_args=()
+    $json_mode && json_args+=(--json)
+
+    "${snapshot_cmd[@]}" capture "$pid1" --name "proc1" "${json_args[@]}" >/dev/null
+
     # Capture PID2
-    "$snapshot_tool" capture "$pid2" --name "proc2" $json_flag >/dev/null
-    
+    "${snapshot_cmd[@]}" capture "$pid2" --name "proc2" "${json_args[@]}" >/dev/null
+
     # Diff them
-    "$snapshot_tool" diff "proc1" "proc2" $json_flag
+    "${snapshot_cmd[@]}" diff "proc1" "proc2" "${json_args[@]}"
 }
 
 main "$@"

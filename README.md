@@ -91,7 +91,7 @@ This direct approach ensures that the data presented is an accurate, unadulterat
 
 * **Operating System:** Linux (Kernel 4.15 or newer recommended).
 * **Shell:** Bash 4.0 or newer.
-* **Dependencies:** `awk`, `sed`, `grep`, `bc`.
+* **Dependencies:** `awk`, `sed`, `grep`; `bc` or the bundled lightweight fallback in `bin/bc`.
 * **Optional:** `jq` (Required only for JSON output formatting).
 
 > **Note on Windows (WSL):** Substrata9 is compatible with WSL 2; however, it is limited to inspecting the Linux subsystem. It cannot access or inspect Windows host processes running outside the WSL environment.

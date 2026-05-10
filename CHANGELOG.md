@@ -6,6 +6,47 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Planned
+- **Styling & linting:** Apply ShellCheck-driven style and robustness
+	fixes in a future maintenance commit (traps quoting, safe `printf`
+	formats, avoid parsing `ls`, and other non-functional improvements).
+- **GPU process visibility:** Add GPU-aware process diagnostics using
+	`nvidia-smi` where available, with room for other vendor backends later.
+
+---
+
+## [1.2.1] - 2026-05-10
+
+### Fixed
+- **JSON validity** — Corrected malformed JSON in `s9-fdmap` file/socket/leak modes and selective `s9-anomaly --json` checks.
+- **JSON export streams** — Moved export status messages for JSON output to stderr so stdout remains parseable.
+- **CLI help/version behavior** — Deferred Linux, `/proc`, and `bc` checks until after `--help` and `--version` are handled.
+- **Argument validation** — Added friendly errors for options missing required values such as `--top`, `--pid`, `--export`, and `--name`.
+- **Snapshot safety** — Moved snapshot directory creation out of read-only commands and replaced `ls | xargs rm` deletion with quoted array-based removal.
+- **Process stat parsing** — Added safe `/proc/[pid]/stat` field extraction so process names containing spaces or parentheses do not corrupt age/start-time calculations.
+- **Socket lookup coverage** — Added IPv6 socket scans via `/proc/net/tcp6` and `/proc/net/udp6`.
+- **Safe directory validation** — Tightened HOME path boundary checks for custom snapshot directories.
+- **Tree JSON guard** — `s9-tree --json --user` now fails clearly instead of emitting concatenated JSON objects.
+- **Bundled calculator fallback** — Project math now calls the repo-local `bin/bc` through Bash when system `bc` is absent, so a missing executable bit no longer breaks tests.
+- **Compare helper execution** — `s9-compare` can invoke its sibling `s9-snapshot` through Bash when executable bits are missing.
+- **USAGE rendering** — Fixed a truncated code block in the usage guide.
+
+### Added
+- Enhanced test coverage for JSON validity, CLI argument handling, and edge cases.
+- GitHub Actions CI plus issue and pull request templates.
+- Cross-platform `.gitattributes` rules for shell scripts, extensionless Bash tools, docs, and binary assets.
+- Production and diagnostic performance guidance in the documentation.
+
+### Changed
+- `make test` now runs the full shell test runner in `tests/run_tests.sh`.
+- Test scripts and the temporary verifier invoke tools through Bash to avoid cascading permission errors while still reporting missing release executable bits.
+- The temporary verifier normalizes executable bits for shell entrypoints and forces ANSI colors when launched from a color-capable terminal.
+- JSON documentation now matches the emitted field names and snapshot diff shape.
+- Documentation was refined with clearer setup, usage, troubleshooting, and CI guidance.
+- Bundled `bin/` scripts were marked executable so tools are runnable immediately after checkout.
+
 ## [1.2.0] - 2026-01-02
 
 ### Fixed
@@ -26,30 +67,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 - Architecture diagram now includes `s9-compare` tool
 - Improved namespace detection using PID namespace (most reliable indicator)
-
----
-
-## [Unreleased]
-
-### Added
-- Enhanced test suite with 60+ unit tests covering edge cases and error handling
-- CI/CD documentation with GitHub Actions workflow example
-- Performance guidelines for production vs. diagnostic use
-
-### Changed
-- Improved CRLF handling for cross-platform compatibility
-- Refined documentation with clearer explanations
-- Marked bundled `bin/` scripts as executable so tools are runnable
-  immediately after checkout (mode-only change; no code or behavior
-  changes).
-
-### Planned
-- **Styling & linting:** Apply ShellCheck-driven style and robustness
-	fixes in a future maintenance commit (traps quoting, safe `printf`
-	formats, avoid parsing `ls`, and other non-functional improvements).
-
-### Fixed
-- Truncated code block in USAGE.md
 
 ---
 
@@ -102,6 +119,7 @@ Initial public release.
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 1.2.1 | 2026-05-10 | JSON validity, CLI guards, safer snapshots, test wiring |
 | 1.2.0 | 2026-01-02 | Bug fixes, improved container detection, documentation |
 | 1.1.0 | 2025-12-05 | Process comparison, test improvements |
 | 1.0.0 | 2025-11-01 | Initial release with 5 core tools |

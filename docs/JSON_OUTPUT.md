@@ -36,22 +36,22 @@ Returns detailed information about a single process.
 
 ```json
 {
-  "pid": "1234",
+  "pid": 1234,
   "name": "nginx",
-  "state": "S (sleeping)",
-  "ppid": "1",
-  "uid": "33",
+  "state": "S",
+  "ppid": 1,
+  "uid": 33,
   "user": "www-data",
-  "threads": "1",
+  "threads": 1,
   "exe": "/usr/sbin/nginx",
   "cwd": "/var/www/html",
   "cmdline": "nginx: worker process",
   "container": "docker",
-  "vm_size_kb": "10240",
-  "rss_kb": "5120",
-  "fd_count": "12",
-  "io_read_chars": "1000",
-  "io_write_chars": "2000"
+  "vm_size_kb": 10240,
+  "rss_kb": 5120,
+  "fd_count": 12,
+  "io_read_chars": 1000,
+  "io_write_chars": 2000
 }
 ```
 
@@ -60,29 +60,29 @@ Returns detailed information about a single process.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name (from `/proc/[pid]/comm`) |
-| `state` | string | Process state with description (e.g., "S (sleeping)") |
-| `ppid` | string | Parent process ID |
-| `uid` | string | User ID of process owner |
+| `state` | string | Single-character process state code (for example, "S") |
+| `ppid` | number | Parent process ID |
+| `uid` | number | User ID of process owner |
 | `user` | string | Username of process owner |
-| `threads` | string | Number of threads |
+| `threads` | number | Number of threads |
 | `exe` | string | Path to executable |
 | `cwd` | string | Current working directory |
 | `cmdline` | string | Full command line |
 | `container` | string | Container type if detected ("docker", "k8s", "lxc", or empty) |
-| `vm_size_kb` | string | Virtual memory size in kilobytes |
-| `rss_kb` | string | Resident set size (physical memory) in kilobytes |
-| `fd_count` | string | Number of open file descriptors |
-| `io_read_chars` | string | Bytes read (requires root) |
-| `io_write_chars` | string | Bytes written (requires root) |
+| `vm_size_kb` | number | Virtual memory size in kilobytes |
+| `rss_kb` | number | Resident set size (physical memory) in kilobytes |
+| `fd_count` | number | Number of open file descriptors |
+| `io_read_chars` | number | Characters read from `/proc/[pid]/io` (requires permission) |
+| `io_write_chars` | number | Characters written from `/proc/[pid]/io` (requires permission) |
 
 
 ### Example Queries
 
 ```bash
 # Get memory usage in MB
-s9-inspect nginx --json | jq '.rss_kb | tonumber / 1024'
+s9-inspect nginx --json | jq '.rss_kb / 1024'
 
 # Check if process is in a container
 s9-inspect 1234 --json | jq 'if .container != "" then "containerized" else "host" end'
@@ -97,39 +97,47 @@ Returns a recursive tree structure representing the process hierarchy.
 
 **When to use:** You need to analyze parent-child relationships programmatically, or build a visualization.
 
+`s9-tree --json` emits the tree rooted at the selected PID. User filtering is intentionally limited to text output for now; use `jq` to filter JSON output by the `user` field.
+
 ### Schema
 
 ```json
 {
-  "pid": "1",
+  "pid": 1,
   "name": "systemd",
   "state": "S",
-  "rss_kb": "12345",
+  "rss_kb": 12345,
+  "user": "root",
+  "threads": 1,
+  "container": "",
   "children": [
     {
-      "pid": "100",
+      "pid": 100,
       "name": "systemd-journald",
       "state": "S",
-      "rss_kb": "5678",
+      "rss_kb": 5678,
+      "user": "root",
+      "threads": 1,
+      "container": "",
       "children": []
     },
     {
-      "pid": "200",
+      "pid": 200,
       "name": "sshd",
       "state": "S",
-      "rss_kb": "3456",
+      "rss_kb": 3456,
       "children": [
         {
-          "pid": "201",
+          "pid": 201,
           "name": "sshd",
           "state": "S",
-          "rss_kb": "4567",
+          "rss_kb": 4567,
           "children": [
             {
-              "pid": "202",
+              "pid": 202,
               "name": "bash",
               "state": "S",
-              "rss_kb": "2345",
+              "rss_kb": 2345,
               "children": []
             }
           ]
@@ -145,10 +153,13 @@ Returns a recursive tree structure representing the process hierarchy.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name |
 | `state` | string | Single-character state code (R, S, D, Z, T) |
-| `rss_kb` | string | Resident memory in kilobytes |
+| `rss_kb` | number | Resident memory in kilobytes |
+| `user` | string | Process owner |
+| `threads` | number | Number of threads |
+| `container` | string | Container or namespace marker if detected, otherwise empty |
 | `children` | array | Array of child process objects (recursive) |
 
 
@@ -159,7 +170,7 @@ Returns a recursive tree structure representing the process hierarchy.
 s9-tree --json | jq '.. | .name? // empty'
 
 # Find all processes with more than 100MB RSS
-s9-tree --json | jq '.. | select(.rss_kb? and (.rss_kb | tonumber) > 102400) | {name, pid, rss_kb}'
+s9-tree --json | jq '.. | select(.rss_kb? and .rss_kb > 102400) | {name, pid, rss_kb}'
 
 # Count total processes in tree
 s9-tree --json | jq '[.. | .pid? // empty] | length'
@@ -183,23 +194,23 @@ When run without search options:
 {
   "summary": [
     {
-      "pid": "1234",
+      "pid": 1234,
       "name": "nginx",
-      "fd_count": "1024",
+      "fd_count": 1024,
       "user": "www-data"
     },
     {
-      "pid": "5678",
+      "pid": 5678,
       "name": "mysql",
-      "fd_count": "512",
+      "fd_count": 512,
       "user": "mysql"
     }
   ],
   "stats": {
-    "total_processes": "150",
-    "total_fds": "5000",
-    "system_allocated": "5000",
-    "system_max": "100000"
+    "total_processes": 150,
+    "total_fds": 5000,
+    "system_allocated": 5000,
+    "system_max": 100000
   }
 }
 ```
@@ -211,32 +222,32 @@ When run without search options:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name |
-| `fd_count` | string | Number of open file descriptors |
+| `fd_count` | number | Number of open file descriptors |
 | `user` | string | Process owner |
 
 **stats object:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `total_processes` | string | Number of processes scanned |
-| `total_fds` | string | Total FDs across all processes |
-| `system_allocated` | string | System-wide allocated FDs |
-| `system_max` | string | System-wide FD limit |
+| `total_processes` | number | Number of processes scanned |
+| `total_fds` | number | Total FDs across all processes |
+| `system_allocated` | number | System-wide allocated FDs |
+| `system_max` | number | System-wide FD limit |
 
 
 ### Example Queries
 
 ```bash
 # Get top 5 FD consumers
-s9-fdmap --json | jq '.summary | sort_by(.fd_count | tonumber) | reverse | .[0:5]'
+s9-fdmap --json | jq '.summary | sort_by(.fd_count) | reverse | .[0:5]'
 
 # Find processes with more than 500 FDs
-s9-fdmap --json | jq '.summary[] | select((.fd_count | tonumber) > 500)'
+s9-fdmap --json | jq '.summary[] | select(.fd_count > 500)'
 
 # Calculate FD usage percentage
-s9-fdmap --json | jq '.stats | ((.total_fds | tonumber) / (.system_max | tonumber) * 100) | round'
+s9-fdmap --json | jq '.stats | ((.total_fds / .system_max) * 100) | round'
 ```
 
 ## s9-anomaly
@@ -252,26 +263,26 @@ Returns arrays of detected anomalies, organized by type.
 {
   "zombies": [
     {
-      "pid": "123",
+      "pid": 123,
       "name": "defunct_proc",
-      "ppid": "100",
+      "ppid": 100,
       "parent_name": "bad_parent",
       "age": "10m"
     }
   ],
   "hogs": [
     {
-      "pid": "456",
+      "pid": 456,
       "name": "leak_app",
-      "rss_kb": "999999",
-      "rss_percent": "45.2",
-      "fd_count": "2000",
-      "issues": "HIGH-MEM,HIGH-FD"
+      "rss_kb": 999999,
+      "rss_percent": 45.2,
+      "fd_count": 2000,
+      "issues": "HIGH-MEM HIGH-FDS"
     }
   ],
   "unusual_states": [
     {
-      "pid": "789",
+      "pid": 789,
       "name": "stuck_io",
       "state": "D",
       "state_desc": "disk sleep"
@@ -279,10 +290,11 @@ Returns arrays of detected anomalies, organized by type.
   ],
   "orphans": [
     {
-      "pid": "321",
+      "pid": 321,
       "name": "orphan_worker",
-      "original_ppid": "999",
-      "user": "www-data"
+      "ppid": 1,
+      "user": "www-data",
+      "command": "/usr/bin/orphan_worker"
     }
   ]
 }
@@ -295,9 +307,9 @@ Returns arrays of detected anomalies, organized by type.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Zombie process ID |
+| `pid` | number | Zombie process ID |
 | `name` | string | Process name |
-| `ppid` | string | Parent PID (who should reap it) |
+| `ppid` | number | Parent PID (who should reap it) |
 | `parent_name` | string | Parent process name |
 | `age` | string | How long it's been a zombie |
 
@@ -305,18 +317,18 @@ Returns arrays of detected anomalies, organized by type.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name |
-| `rss_kb` | string | Memory usage in KB |
-| `rss_percent` | string | Percentage of system memory |
-| `fd_count` | string | Number of open FDs |
-| `issues` | string | Comma-separated issue flags (HIGH-MEM, HIGH-FD) |
+| `rss_kb` | number | Memory usage in KB |
+| `rss_percent` | number | Percentage of system memory |
+| `fd_count` | number | Number of open FDs |
+| `issues` | string | Space-separated issue flags (HIGH-MEM, HIGH-FDS) |
 
 **unusual_states array:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name |
 | `state` | string | State code (D, T, etc.) |
 | `state_desc` | string | Human-readable state description |
@@ -325,10 +337,11 @@ Returns arrays of detected anomalies, organized by type.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pid` | string | Process ID |
+| `pid` | number | Process ID |
 | `name` | string | Process name |
-| `original_ppid` | string | Original parent PID (before adoption) |
+| `ppid` | number | Current parent PID, usually 1 for adopted processes |
 | `user` | string | Process owner |
+| `command` | string | Command line, when available |
 
 
 ### Example Queries
@@ -344,7 +357,7 @@ s9-anomaly --json | jq '.hogs[].pid'
 s9-anomaly --json | jq '{zombies: (.zombies | length), hogs: (.hogs | length), stuck: (.unusual_states | length)}'
 
 # Find memory hogs using more than 50% RAM
-s9-anomaly --json | jq '.hogs[] | select((.rss_percent | tonumber) > 50)'
+s9-anomaly --json | jq '.hogs[] | select(.rss_percent > 50)'
 ```
 
 ## s9-snapshot
@@ -361,7 +374,7 @@ Returns status information for capture operations and comparison results for dif
   "status": "success",
   "file": "/home/user/.substrata9/snapshots/baseline_1234_20250115.snap",
   "name": "baseline",
-  "pid": "1234",
+  "pid": 1234,
   "timestamp": "2025-01-15 12:00:00"
 }
 ```
@@ -371,40 +384,35 @@ Returns status information for capture operations and comparison results for dif
 
 ```json
 {
-  "before": {
-    "name": "baseline",
-    "file": "baseline_1234_20250115.snap",
-    "timestamp": "2025-01-15 12:00:00"
-  },
-  "after": {
-    "name": "after_load",
-    "file": "after_load_1234_20250115.snap",
-    "timestamp": "2025-01-15 13:00:00"
-  },
+  "before": "baseline_1234_20250115_120000.snap",
+  "after": "after_load_1234_20250115_130000.snap",
+  "pid1": 1234,
+  "pid2": 1234,
   "memory": {
-    "rss_before_kb": "10240",
-    "rss_after_kb": "15360",
-    "rss_diff_kb": "5120",
-    "rss_diff_percent": "50.0",
-    "vmsize_before_kb": "102400",
-    "vmsize_after_kb": "153600",
-    "vmsize_diff_kb": "51200",
-    "vmsize_diff_percent": "50.0"
+    "rss_before_kb": 10240,
+    "rss_after_kb": 15360,
+    "rss_diff_kb": 5120,
+    "vmsize_before_kb": 102400,
+    "vmsize_after_kb": 153600,
+    "vmsize_diff_kb": 51200,
+    "vmswap_before_kb": 0,
+    "vmswap_after_kb": 0
   },
-  "fds": {
-    "before": "100",
-    "after": "150",
-    "diff": "50"
-  },
-  "threads": {
-    "before": "4",
-    "after": "8",
-    "diff": "4"
+  "resources": {
+    "fd_before": 100,
+    "fd_after": 150,
+    "fd_diff": 50,
+    "threads_before": 4,
+    "threads_after": 8,
+    "threads_diff": 4
   },
   "assessment": {
-    "memory_status": "warning",
-    "fd_status": "warning",
-    "overall": "investigate"
+    "memory_status": "moderate_growth",
+    "fd_status": "moderate_growth",
+    "threads_status": "stable",
+    "rss_diff_kb": 5120,
+    "fd_diff": 50,
+    "threads_diff": 0
   }
 }
 ```
@@ -416,9 +424,12 @@ Returns status information for capture operations and comparison results for dif
 
 | Field | Type | Values | Description |
 |-------|------|--------|-------------|
-| `memory_status` | string | "stable", "warning", "critical" | Memory growth assessment |
-| `fd_status` | string | "stable", "warning", "critical" | FD growth assessment |
-| `overall` | string | "healthy", "investigate", "critical" | Overall recommendation |
+| `memory_status` | string | "stable", "moderate_growth", "critical_growth", "significant_decrease" | Memory growth assessment |
+| `fd_status` | string | "stable", "moderate_growth", "critical_growth" | FD growth assessment |
+| `threads_status` | string | "stable", "significant_change" | Thread growth assessment |
+| `rss_diff_kb` | number | RSS delta in kilobytes |
+| `fd_diff` | number | File descriptor count delta |
+| `threads_diff` | number | Thread count delta |
 
 
 ### Example Queries
@@ -428,10 +439,18 @@ Returns status information for capture operations and comparison results for dif
 s9-snapshot diff baseline after_load --json | jq '.assessment.memory_status'
 
 # Get memory growth in MB
-s9-snapshot diff baseline after_load --json | jq '.memory.rss_diff_kb | tonumber / 1024'
+s9-snapshot diff baseline after_load --json | jq '.memory.rss_diff_kb / 1024'
 
-# Alert if overall status is critical
-s9-snapshot diff baseline after_load --json | jq 'if .assessment.overall == "critical" then "ALERT!" else "OK" end'
+# Alert if memory status is critical
+s9-snapshot diff baseline after_load --json | jq 'if .assessment.memory_status == "critical_growth" then "ALERT!" else "OK" end'
+```
+
+## s9-compare
+
+`s9-compare --json` emits the same comparison schema as `s9-snapshot diff --json`. It creates temporary snapshots for the two live process targets, compares them, and removes the temporary snapshot directory when the command exits.
+
+```bash
+s9-compare 1234 5678 --json | jq '.resources'
 ```
 
 ## Tips for Working with JSON Output

@@ -154,13 +154,16 @@ Your terminal doesn't support ANSI color codes, or you're piping output somewher
 # Disable colors entirely
 NO_COLOR=1 s9-inspect 1234
 
+# Force colors when output is going through tee, sudo, or another wrapper
+FORCE_COLOR=1 s9-inspect 1234
+
 # Or if piping to a pager, tell it to handle colors
 s9-tree | less -R
 ```
 
 **Using an older terminal?**
 
-Substrata9 detects "dumb" terminals and disables colors automatically. If detection isn't working, set `TERM=dumb` or `NO_COLOR=1`.
+Substrata9 detects "dumb" terminals and disables colors automatically. If detection isn't working, set `TERM=dumb` or `NO_COLOR=1`. The release verifier exports `FORCE_COLOR=1` when it starts from a color-capable terminal, so tool output stays colored while being captured with `tee`.
 
 ## JSON Output Issues
 
@@ -261,14 +264,19 @@ The execute bit isn't set on the script files.
 **The fix:**
 
 ```bash
-chmod +x bin/*
-chmod +x examples/*
-chmod +x lib/*
+chmod +x bin/s9-* bin/bc
+chmod +x tests/*.sh examples/*.sh
 ```
 
 **Cloned on Windows?**
 
 Git on Windows sometimes doesn't preserve execute permissions. The `chmod` fix above will sort it out.
+
+You can also run tools explicitly through Bash while diagnosing permission issues:
+
+```bash
+bash ./bin/s9-inspect 1234
+```
 
 ## Slow Performance
 

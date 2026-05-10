@@ -2,9 +2,9 @@ name: Substrata9 CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
 
 jobs:
   test:
@@ -12,56 +12,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc jq shellcheck
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc jq shellcheck
 
-    - name: Make Scripts Executable
-      run: |
-        chmod +x bin/* 
-        chmod +x tests/*.sh || true  # In case the folder doesn't exist
+      - name: Make Scripts Executable
+        run: |
+          chmod +x bin/s9-* bin/bc
+          chmod +x tests/*.sh examples/*.sh
 
-    ###########################################################
-    # SHELLCHECK (Non-Fatal Warnings)
-    #
-    # - Only errors break CI
-    # - Warnings/info messages still show in logs
-    ###########################################################
-    - name: Run ShellCheck (Errors Only)
-      run: |
-        echo "Running ShellCheck..."
-        
-        # Only fail on real errors (--severity=error)
-        shellcheck --severity=error bin/s9-* lib/*.sh
-        
-        # Additionally print all warnings/info (does not fail CI)
-        echo "--- ShellCheck Warnings (non-fatal) ---"
-        shellcheck bin/s9-* lib/*.sh || true
-        
+      - name: Run ShellCheck (Errors Only)
+        run: |
+          echo "Running ShellCheck..."
 
-    ###########################################################
-    # TEST SUITE
-    ###########################################################
-    - name: Run Tests
-      run: |
-        if command -v make >/dev/null 2>&1; then
-          make test
-        else
-          echo "No Makefile tests found."
-        fi
+          # Only fail on real errors (--severity=error).
+          shellcheck -x --severity=error bin/s9-* bin/bc lib/*.sh tests/*.sh examples/*.sh
 
-    ###########################################################
-    # COLOR RENDERING CHECK
-    ###########################################################
-    - name: Verify Color Rendering
-      run: |
-        echo "Checking for printf %b usage..."
-        if grep -rq "printf.*%b" bin/ lib/; then
-          echo "✓ Color rendering check passed"
-        else
-          echo "Warning: No printf %b found — some color sequences may not render properly"
-        fi
+          # Additionally print all warnings/info without failing CI.
+          echo "--- ShellCheck Warnings (non-fatal) ---"
+          shellcheck -x bin/s9-* bin/bc lib/*.sh tests/*.sh examples/*.sh || true
+
+      - name: Run Tests
+        run: make test
+
+      - name: Verify Forced Color Rendering
+        run: |
+          echo "Checking forced ANSI color output..."
+          output="$(FORCE_COLOR=1 bash bin/s9-tree --help)"
+          if printf '%s' "$output" | grep -q $'\033'; then
+            echo "OK: forced color rendering check passed"
+          else
+            echo "Forced color output did not include ANSI escape sequences"
+            exit 1
+          fi

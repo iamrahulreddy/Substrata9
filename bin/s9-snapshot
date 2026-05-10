@@ -22,36 +22,64 @@ source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
-# Run initialization checks
-s9_init
-
 #------------------------------------------------------------------------------
 # Configuration
 #------------------------------------------------------------------------------
-# Validate and set snapshot directory
-SNAPSHOT_DIR="${S9_SNAPSHOT_DIR:-$HOME/.substrata9/snapshots}"
+SNAPSHOT_DIR=""
 JSON_MODE=false
-
-# Security: Validate directory is in safe location
-if [[ -n "${S9_SNAPSHOT_DIR:-}" ]]; then
-    s9_validate_safe_dir "$SNAPSHOT_DIR" || s9_die "Unsafe snapshot directory: $SNAPSHOT_DIR"
-fi
-
-mkdir -p "$SNAPSHOT_DIR"
-chmod 700 "$SNAPSHOT_DIR" 2>/dev/null || true
 
 #------------------------------------------------------------------------------
 # Snapshot Functions
 #------------------------------------------------------------------------------
 
+resolve_snapshot_dir() {
+    if [[ -z "${HOME:-}" ]] && [[ -z "${S9_SNAPSHOT_DIR:-}" ]]; then
+        s9_die "HOME is not set; set S9_SNAPSHOT_DIR to choose a snapshot directory"
+    fi
+
+    SNAPSHOT_DIR="${S9_SNAPSHOT_DIR:-${HOME}/.substrata9/snapshots}"
+
+    # Security: Validate user-provided directory is in a safe location.
+    if [[ -n "${S9_SNAPSHOT_DIR:-}" ]]; then
+        s9_validate_safe_dir "$SNAPSHOT_DIR" || s9_die "Unsafe snapshot directory: $SNAPSHOT_DIR"
+    fi
+}
+
+ensure_snapshot_dir() {
+    resolve_snapshot_dir
+    mkdir -p "$SNAPSHOT_DIR" || s9_die "Cannot create snapshot directory: $SNAPSHOT_DIR"
+    chmod 700 "$SNAPSHOT_DIR" 2>/dev/null || true
+}
+
+latest_snapshot_for_name() {
+    local snap_name="$1"
+    local -a snaps=()
+
+    shopt -s nullglob
+    snaps=( "$SNAPSHOT_DIR/${snap_name}"_*.snap )
+    shopt -u nullglob
+
+    (( ${#snaps[@]} > 0 )) || return 1
+
+    local latest="${snaps[0]}"
+    local snap
+    for snap in "${snaps[@]}"; do
+        if [[ "$snap" -nt "$latest" ]]; then
+            latest="$snap"
+        fi
+    done
+
+    printf "%s\n" "$latest"
+}
+
 capture_snapshot() {
     local pid=$1
     local snap_name=$2
-    
+
     # Validate PID is numeric
     [[ "$pid" =~ ^[0-9]+$ ]] || s9_die "PID must be a number"
     [[ -d "/proc/$pid" ]] || s9_die "Process $pid does not exist"
-    
+
     # Sanitize snapshot name to prevent path injection
     local safe_name="${snap_name//[^a-zA-Z0-9_-]/}"
     if [[ "$safe_name" != "$snap_name" ]]; then
@@ -59,20 +87,20 @@ capture_snapshot() {
         snap_name="$safe_name"
     fi
     [[ -n "$snap_name" ]] || s9_die "Snapshot name cannot be empty after sanitization"
-    
+
     # Validate snapshot name length (max 64 characters)
     if (( ${#snap_name} > 64 )); then
         s9_die "Snapshot name too long (max 64 characters, got ${#snap_name})"
     fi
-    
+
     local timestamp
     timestamp=$(date '+%Y%m%d_%H%M%S')
     local snap_file="$SNAPSHOT_DIR/${snap_name}_${pid}_${timestamp}.snap"
-    
+
     if ! $JSON_MODE; then
         s9_info "Capturing snapshot of PID $pid..."
     fi
-    
+
     {
         echo "# Substrata9 Process Snapshot"
         echo "# Version: $S9_VERSION"
@@ -81,19 +109,19 @@ capture_snapshot() {
         echo "# Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "# Kernel: $(uname -r)"
         echo ""
-        
+
         echo "[STATUS]"
         cat "/proc/$pid/status" 2>/dev/null || echo "ERROR: Cannot read status"
         echo ""
-        
+
         echo "[STAT]"
         cat "/proc/$pid/stat" 2>/dev/null || echo "ERROR: Cannot read stat"
         echo ""
-        
+
         echo "[CMDLINE]"
         tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || echo "ERROR: Cannot read cmdline"
         echo -e "\n"
-        
+
         echo "[FD_COUNT]"
         if [[ -r "/proc/$pid/fd" ]]; then
             ls -1 -- "/proc/$pid/fd" 2>/dev/null | wc -l
@@ -101,7 +129,7 @@ capture_snapshot() {
             echo "0"
         fi
         echo ""
-        
+
         echo "[FD_LIST]"
         if [[ -r "/proc/$pid/fd" ]]; then
             for fd in /proc/$pid/fd/*; do
@@ -115,15 +143,15 @@ capture_snapshot() {
             echo "ERROR: Cannot read fd directory"
         fi
         echo ""
-        
+
         echo "[LIMITS]"
         cat "/proc/$pid/limits" 2>/dev/null || echo "ERROR: Cannot read limits"
         echo ""
-        
+
         echo "[IO]"
         cat "/proc/$pid/io" 2>/dev/null || echo "ERROR: Cannot read I/O stats (requires root)"
         echo ""
-        
+
         echo "[MAPS_SUMMARY]"
         if [[ -r "/proc/$pid/maps" ]]; then
             echo "Regions: $(wc -l < "/proc/$pid/maps")"
@@ -132,9 +160,9 @@ capture_snapshot() {
         else
             echo "ERROR: Cannot read maps"
         fi
-        
+
     } > "$snap_file"
-    
+
     if $JSON_MODE; then
         echo "{"
         s9_json_kv "status" "success"
@@ -160,7 +188,7 @@ list_snapshots() {
         printf "%bAvailable Snapshots:%b\n" "${S9_BOLD}" "${S9_NC}"
         echo ""
     fi
-    
+
     if [[ ! -d "$SNAPSHOT_DIR" ]] || [[ -z "$(ls -A "$SNAPSHOT_DIR" 2>/dev/null)" ]]; then
         if $JSON_MODE; then
             echo "  ]"
@@ -172,26 +200,26 @@ list_snapshots() {
         fi
         return
     fi
-    
+
     if ! $JSON_MODE; then
         printf "  ${S9_BOLD}%-20s %-8s %-20s %-10s${S9_NC}\n" "NAME" "PID" "TIMESTAMP" "SIZE"
         printf "  ${S9_DIM}─────────────────────────────────────────────────────────────────────${S9_NC}\n"
     fi
-    
+
     local first=true
-    
+
     for snap in "$SNAPSHOT_DIR"/*.snap; do
         [[ -f "$snap" ]] || continue
-        
+
         local basename="${snap##*/}"
         # Parse filename: name_pid_YYYYMMDD_HHMMSS.snap
         # The timestamp has format YYYYMMDD_HHMMSS (with underscore)
         # So we extract from the right: _HHMMSS, _YYYYMMDD, _pid, then rest is name
         local name pid timestamp
-        
+
         # Remove .snap extension
         local noext="${basename%.snap}"
-        
+
         # Extract parts from the right (timestamp has underscore so it's 2 parts)
         local hhmmss="${noext##*_}"
         local rest1="${noext%_*}"
@@ -199,10 +227,10 @@ list_snapshots() {
         local rest2="${rest1%_*}"
         pid="${rest2##*_}"
         name="${rest2%_*}"
-        
+
         # Combine timestamp
         timestamp="${yyyymmdd}_${hhmmss}"
-        
+
         # Format timestamp (YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM)
         local formatted=""
         if [[ ${#timestamp} -ge 15 ]]; then
@@ -216,10 +244,10 @@ list_snapshots() {
         else
             formatted="$timestamp"
         fi
-        
+
         local size
         size=$(du -h "$snap" | cut -f1)
-        
+
         if $JSON_MODE; then
             if $first; then first=false; else echo ","; fi
             echo "    {"
@@ -234,7 +262,7 @@ list_snapshots() {
                 "${name:0:20}" "$pid" "$formatted" "$size"
         fi
     done
-    
+
     if $JSON_MODE; then
         echo ""
         echo "  ]"
@@ -248,26 +276,26 @@ list_snapshots() {
 diff_snapshots() {
     local snap1_name=$1
     local snap2_name=$2
-    
+
     # Sanitize snapshot names
     snap1_name="${snap1_name//[^a-zA-Z0-9_-]/}"
     snap2_name="${snap2_name//[^a-zA-Z0-9_-]/}"
-    
+
     [[ -n "$snap1_name" ]] || s9_die "Invalid snapshot name"
     [[ -n "$snap2_name" ]] || s9_die "Invalid snapshot name"
-    
+
     # Find most recent snapshot matching each name
     local snap1 snap2
-    snap1=$(ls -t -- "$SNAPSHOT_DIR/${snap1_name}"_*.snap 2>/dev/null | head -1) || true
-    snap2=$(ls -t -- "$SNAPSHOT_DIR/${snap2_name}"_*.snap 2>/dev/null | head -1) || true
-    
+    snap1=$(latest_snapshot_for_name "$snap1_name") || true
+    snap2=$(latest_snapshot_for_name "$snap2_name") || true
+
     [[ -f "$snap1" ]] || s9_die "Snapshot '$snap1_name' not found"
     [[ -f "$snap2" ]] || s9_die "Snapshot '$snap2_name' not found"
-    
+
     # Validate snapshot format
     grep -q "^# Substrata9 Process Snapshot" "$snap1" || s9_die "Invalid snapshot format: $snap1"
     grep -q "^# Substrata9 Process Snapshot" "$snap2" || s9_die "Invalid snapshot format: $snap2"
-    
+
     # Extract metadata
     local time1 time2 pid1 pid2 name1 name2
     time1=$(grep "^# Timestamp:" "$snap1" | cut -d: -f2- | xargs)
@@ -276,12 +304,12 @@ diff_snapshots() {
     pid2=$(grep "^# PID:" "$snap2" | awk '{print $3}')
     name1=$(grep "^# Name:" "$snap1" | cut -d: -f2 | xargs)
     name2=$(grep "^# Name:" "$snap2" | cut -d: -f2 | xargs)
-    
+
     # Get process names from snapshot status section
     local proc_name1 proc_name2
     proc_name1=$(grep "^Name:" "$snap1" 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
     proc_name2=$(grep "^Name:" "$snap2" 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
-    
+
     if $JSON_MODE; then
         echo "{"
         s9_json_kv "before" "$(basename "$snap1")"
@@ -290,13 +318,13 @@ diff_snapshots() {
         s9_json_kv "pid2" "$pid2"
     else
         s9_box_title "Substrata9 — Process Comparison" "Analyzing resource differences between snapshots"
-        
+
         echo ""
         printf "  ${S9_BOLD}%-12s${S9_NC} %s (%s) — %bPID %s%b\n" "Before:" "$name1" "$proc_name1" "${S9_CYAN}" "$pid1" "${S9_NC}"
         printf "  ${S9_BOLD}%-12s${S9_NC} %s (%s) — %bPID %s%b\n" "After:" "$name2" "$proc_name2" "${S9_CYAN}" "$pid2" "${S9_NC}"
         printf "  ${S9_DIM}Time span:   %s → %s${S9_NC}\n" "$time1" "$time2"
     fi
-    
+
     # =========================================================================
     # MEMORY COMPARISON
     # =========================================================================
@@ -309,7 +337,7 @@ diff_snapshots() {
     vmswap2=$(grep "^VmSwap:" "$snap2" 2>/dev/null | awk '{print $2}' || echo "0")
     vmpeak1=$(grep "^VmPeak:" "$snap1" 2>/dev/null | awk '{print $2}' || echo "0")
     vmpeak2=$(grep "^VmPeak:" "$snap2" 2>/dev/null | awk '{print $2}' || echo "0")
-    
+
     # Ensure numeric
     [[ "$rss1" =~ ^[0-9]+$ ]] || rss1=0
     [[ "$rss2" =~ ^[0-9]+$ ]] || rss2=0
@@ -319,7 +347,7 @@ diff_snapshots() {
     [[ "$vmswap2" =~ ^[0-9]+$ ]] || vmswap2=0
     [[ "$vmpeak1" =~ ^[0-9]+$ ]] || vmpeak1=0
     [[ "$vmpeak2" =~ ^[0-9]+$ ]] || vmpeak2=0
-    
+
     if $JSON_MODE; then
         echo "  \"memory\": {"
         s9_json_kv "rss_before_kb" "$rss1"
@@ -339,27 +367,27 @@ diff_snapshots() {
         s9_compare_row "Peak Virtual" "$vmpeak1" "$vmpeak2" "kB" "kb"
         s9_compare_row "Swap" "$vmswap1" "$vmswap2" "kB" "kb"
     fi
-    
+
     # =========================================================================
     # FILE DESCRIPTOR COMPARISON
     # =========================================================================
     local fd1 fd2
     fd1=$(grep -A1 "\[FD_COUNT\]" "$snap1" | tail -1 | tr -d '[:space:]')
     fd2=$(grep -A1 "\[FD_COUNT\]" "$snap2" | tail -1 | tr -d '[:space:]')
-    
+
     [[ "$fd1" =~ ^[0-9]+$ ]] || fd1=0
     [[ "$fd2" =~ ^[0-9]+$ ]] || fd2=0
-    
+
     # =========================================================================
     # THREAD COMPARISON
     # =========================================================================
     local threads1 threads2
     threads1=$(grep "^Threads:" "$snap1" 2>/dev/null | awk '{print $2}' || echo "0")
     threads2=$(grep "^Threads:" "$snap2" 2>/dev/null | awk '{print $2}' || echo "0")
-    
+
     [[ "$threads1" =~ ^[0-9]+$ ]] || threads1=0
     [[ "$threads2" =~ ^[0-9]+$ ]] || threads2=0
-    
+
     if $JSON_MODE; then
         echo "  \"resources\": {"
         s9_json_kv "fd_before" "$fd1"
@@ -375,7 +403,7 @@ diff_snapshots() {
         s9_compare_row "Open FDs" "$fd1" "$fd2" ""
         s9_compare_row "Threads" "$threads1" "$threads2" ""
     fi
-    
+
     # =========================================================================
     # I/O COMPARISON (if available)
     # =========================================================================
@@ -384,13 +412,13 @@ diff_snapshots() {
     rbytes2=$(grep "^read_bytes:" "$snap2" 2>/dev/null | awk '{print $2}' || echo "")
     wbytes1=$(grep "^write_bytes:" "$snap1" 2>/dev/null | awk '{print $2}' || echo "")
     wbytes2=$(grep "^write_bytes:" "$snap2" 2>/dev/null | awk '{print $2}' || echo "")
-    
+
     if [[ -n "$rbytes1" ]] && [[ -n "$rbytes2" ]]; then
         [[ "$rbytes1" =~ ^[0-9]+$ ]] || rbytes1=0
         [[ "$rbytes2" =~ ^[0-9]+$ ]] || rbytes2=0
         [[ "$wbytes1" =~ ^[0-9]+$ ]] || wbytes1=0
         [[ "$wbytes2" =~ ^[0-9]+$ ]] || wbytes2=0
-        
+
         if $JSON_MODE; then
             echo "  \"io\": {"
             s9_json_kv "read_before" "$rbytes1"
@@ -407,7 +435,7 @@ diff_snapshots() {
             s9_compare_row "Disk Write" "$wbytes1" "$wbytes2" "bytes" "bytes"
         fi
     fi
-    
+
     # =========================================================================
     # ASSESSMENT
     # =========================================================================
@@ -415,21 +443,21 @@ diff_snapshots() {
     local fd_diff=$((fd2 - fd1))
     local threads_diff=$((threads2 - threads1))
     local swap_diff=$((vmswap2 - vmswap1))
-    
+
     if $JSON_MODE; then
         echo "  \"assessment\": {"
         local mem_status="stable"
         if (( rss_diff > 100000 )); then mem_status="critical_growth";
         elif (( rss_diff > 10000 )); then mem_status="moderate_growth";
         elif (( rss_diff < -10000 )); then mem_status="significant_decrease"; fi
-        
+
         local fd_status="stable"
         if (( fd_diff > 100 )); then fd_status="critical_growth";
         elif (( fd_diff > 10 )); then fd_status="moderate_growth"; fi
-        
+
         local threads_status="stable"
         if (( threads_diff > 10 )); then threads_status="significant_change"; fi
-        
+
         s9_json_kv "memory_status" "$mem_status"
         s9_json_kv "fd_status" "$fd_status"
         s9_json_kv "threads_status" "$threads_status"
@@ -440,9 +468,9 @@ diff_snapshots() {
         echo "}"
     else
         s9_header "ASSESSMENT"
-        
+
         local issues_found=0
-        
+
         # Memory assessment
         if (( rss_diff > 100000 )); then
             printf "  ${S9_RED}⚠ CRITICAL:${S9_NC} Significant memory growth detected (${S9_RED}+%s${S9_NC})\n" "$(s9_human_kb "$rss_diff")"
@@ -456,14 +484,14 @@ diff_snapshots() {
         else
             printf "  ${S9_GREEN}✓${S9_NC} Memory usage is stable\n"
         fi
-        
+
         # Swap assessment
         if (( swap_diff > 0 )); then
             printf "  ${S9_YELLOW}⚡ WARNING:${S9_NC} Swap usage increased by ${S9_YELLOW}%s${S9_NC}\n" "$(s9_human_kb "$swap_diff")"
             printf "    ${S9_DIM}Process may be under memory pressure.${S9_NC}\n"
             ((issues_found++))
         fi
-        
+
         # FD assessment
         if (( fd_diff > 100 )); then
             printf "  ${S9_RED}⚠ CRITICAL:${S9_NC} Large FD growth detected (${S9_RED}+%d${S9_NC})\n" "$fd_diff"
@@ -477,7 +505,7 @@ diff_snapshots() {
         else
             printf "  ${S9_GREEN}✓${S9_NC} File descriptor count is stable\n"
         fi
-        
+
         # Thread assessment
         if (( threads_diff > 10 )); then
             printf "  ${S9_YELLOW}⚡ Note:${S9_NC} Thread count increased significantly (${S9_YELLOW}+%d${S9_NC})\n" "$threads_diff"
@@ -487,7 +515,7 @@ diff_snapshots() {
         else
             printf "  ${S9_GREEN}✓${S9_NC} Thread count is stable\n"
         fi
-        
+
         # Summary
         echo ""
         if (( issues_found == 0 )); then
@@ -495,7 +523,7 @@ diff_snapshots() {
         else
             printf "  ${S9_YELLOW}${S9_BOLD}Overall: %d potential issue(s) detected${S9_NC}\n" "$issues_found"
         fi
-        
+
         # Footer
         echo ""
         s9_rule
@@ -508,24 +536,26 @@ diff_snapshots() {
 delete_snapshot() {
     local snap_name=$1
     local force_delete=${2:-false}
-    
+
     # Sanitize snapshot name
     snap_name="${snap_name//[^a-zA-Z0-9_-]/}"
     [[ -n "$snap_name" ]] || s9_die "Invalid snapshot name"
-    
-    local snaps
-    snaps=$(ls -- "$SNAPSHOT_DIR/${snap_name}"_*.snap 2>/dev/null) || true
-    
-    if [[ -z "$snaps" ]]; then
+
+    local -a snaps=()
+    shopt -s nullglob
+    snaps=( "$SNAPSHOT_DIR/${snap_name}"_*.snap )
+    shopt -u nullglob
+
+    if (( ${#snaps[@]} == 0 )); then
         s9_die "No snapshots found matching '$snap_name'"
     fi
-    
+
     local count
-    count=$(echo "$snaps" | wc -l)
-    
+    count=${#snaps[@]}
+
     # Skip confirmation in JSON mode or when --force is used
     if $JSON_MODE || $force_delete; then
-        echo "$snaps" | xargs rm -f
+        rm -f -- "${snaps[@]}"
         if $JSON_MODE; then
             echo "{"
             s9_json_kv "status" "deleted"
@@ -536,18 +566,19 @@ delete_snapshot() {
         fi
         return
     fi
-    
+
     echo "Found $count snapshot(s) matching '$snap_name':"
-    echo "$snaps" | while read -r f; do
+    local f
+    for f in "${snaps[@]}"; do
         echo "  $(basename "$f")"
     done
     echo ""
-    
+
     read -p "Delete these snapshots? [y/N] " -n 1 -r
     echo
-    
+
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "$snaps" | xargs rm -f
+        rm -f -- "${snaps[@]}"
         s9_success "Deleted $count snapshot(s)"
     else
         echo "Cancelled"
@@ -561,26 +592,26 @@ delete_snapshot() {
 usage() {
     printf "%bs9-snapshot%b - Process state capture and comparison\n" "$S9_BOLD" "$S9_NC"
     printf "Substrata9 v%s\n\n" "$S9_VERSION"
-    
+
     printf "%bUSAGE:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    s9-snapshot capture <PID> --name <name>\n"
     printf "    s9-snapshot list\n"
     printf "    s9-snapshot diff <name1> <name2>\n"
     printf "    s9-snapshot delete <name> [--force]\n\n"
-    
+
     printf "%bCOMMANDS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    capture    Capture process state snapshot\n"
     printf "    list       List all saved snapshots\n"
     printf "    diff       Compare two snapshots\n"
     printf "    delete     Delete snapshots by name\n\n"
-    
+
     printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    --name NAME    Name for the snapshot (required for capture)\n"
     printf "    --force, -y    Skip confirmation prompt (for delete)\n"
     printf "    -j, --json     Output in JSON format (for list, diff, capture result)\n"
     printf "    -h, --help     Show this help\n"
     printf "    -v, --version  Show version\n\n"
-    
+
     printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    # Capture before and after states\n"
     printf "    s9-snapshot capture \$(pgrep myapp) --name before_test\n"
@@ -595,19 +626,19 @@ usage() {
     printf "\n"
     printf "    # Clean up\n"
     printf "    s9-snapshot delete before_test\n\n"
-    
+
     printf "%bENVIRONMENT:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    S9_SNAPSHOT_DIR    Override snapshot directory (default: ~/.substrata9/snapshots)\n"
-    
+
     exit 0
 }
 
 main() {
     [[ $# -eq 0 ]] && usage
-    
+
     local command="$1"
     shift
-    
+
     # Check for global flags before command specific args
     # This is a bit hacky but works for simple flags
     local args=()
@@ -624,17 +655,18 @@ main() {
         esac
     done
     set -- "${args[@]}"
-    
+
     case "$command" in
         capture)
             [[ $# -ge 1 ]] || s9_die "Usage: s9-snapshot capture <PID> --name <name>"
             local pid="$1"
             shift
-            
+
             local snap_name=""
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --name|-n)
+                        [[ $# -ge 2 ]] || s9_die "--name requires a snapshot name"
                         snap_name="$2"
                         shift 2
                         ;;
@@ -643,15 +675,21 @@ main() {
                         ;;
                 esac
             done
-            
+
             [[ -n "$snap_name" ]] || s9_die "Snapshot name required (--name)"
+            s9_init
+            ensure_snapshot_dir
             capture_snapshot "$pid" "$snap_name"
             ;;
         list)
+            s9_init
+            resolve_snapshot_dir
             list_snapshots
             ;;
         diff)
             [[ $# -eq 2 ]] || s9_die "Usage: s9-snapshot diff <name1> <name2>"
+            s9_init
+            resolve_snapshot_dir
             diff_snapshots "$1" "$2"
             ;;
         delete|rm)
@@ -670,6 +708,8 @@ main() {
                         ;;
                 esac
             done
+            s9_init
+            resolve_snapshot_dir
             delete_snapshot "$del_name" "$force_flag"
             ;;
         -h|--help)
