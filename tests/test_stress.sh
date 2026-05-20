@@ -7,7 +7,6 @@
 # defense, concurrent execution, snapshot lifecycle, and GPU coverage.
 #
 # Designed for Colab / CI environments.
-#
 
 set -uo pipefail
 
@@ -134,21 +133,42 @@ bench_repeat() {
     fi
 }
 
+jq_path_presence_expr() {
+    local key="${1#.}"
+    local path="["
+    local first=true part
+
+    IFS='.' read -ra parts <<< "$key"
+    for part in "${parts[@]}"; do
+        [[ -n "$part" ]] || continue
+        if $first; then
+            first=false
+        else
+            path+=","
+        fi
+        path+="\"$part\""
+    done
+    path+="]"
+
+    printf 'def _s9_haspath($p): if ($p|length)==0 then true elif type=="object" and has($p[0]) then .[$p[0]] | _s9_haspath($p[1:]) else false end; _s9_haspath(%s)' "$path"
+}
+
 # Run command, validate JSON key exists
 json_key() {
     local desc="$1" key="$2"; shift 2
-    local out rc err
+    local out rc err jq_expr
     if ! command -v jq >/dev/null 2>&1; then
         skip "$desc (jq unavailable)"
         return
     fi
+    jq_expr=$(jq_path_presence_expr "$key")
     err=$(mktemp)
     if out=$(timeout "$CMD_TIMEOUT" "$@" 2>"$err"); then
         rc=0
     else
         rc=$?
     fi
-    if (( rc == 0 )) && echo "$out" | jq -e "$key" >/dev/null 2>&1; then
+    if (( rc == 0 )) && echo "$out" | jq -e "$jq_expr" >/dev/null 2>&1; then
         pass "$desc (has $key)"
     else
         local detail="missing $key or exit $rc"
