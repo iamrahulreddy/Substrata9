@@ -98,7 +98,9 @@ Substrata9 has been tested across the following GPU-accelerated environments as 
 | Lightning AI | A100 40 GB | 30-core CPU | 18/18 stages, 0 red flags |
 | Modal (Firecracker) | H100 80 GB | Containerized | 18/18 stages, 0 red flags |
 
-## Limitations
+> [!IMPORTANT]
+> **Limitations** - 
+> Substrata9 is not a production monitoring agent. Each invocation is a one‑shot scan with no daemon mode or caching.
 
 Substrata9 is built for interactive diagnostics and ad-hoc debugging, not continuous production monitoring. The following constraints should be understood before adoption:
 
