@@ -16,6 +16,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/s9-common.sh
 source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
@@ -24,15 +25,31 @@ source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 #------------------------------------------------------------------------------
 MEM_THRESHOLD_PERCENT=80
 FD_THRESHOLD=500
+GPU_THRESHOLD_MB=1024
 
 # Modes
 CHECK_ZOMBIES=false
 CHECK_HOGS=false
 CHECK_STATES=false
 CHECK_ORPHANS=false
+CHECK_GPU=false
 CHECK_ALL=true
 QUIET_MODE=false
+
+# Known system processes that legitimately have PPID=1
+declare -g -A S9_SYSTEM_PROCESSES=(
+    ["systemd"]=1 ["init"]=1 ["kthreadd"]=1 ["rcu_gp"]=1 ["rcu_par_gp"]=1
+    ["kworker"]=1 ["migration"]=1 ["cpuhp"]=1 ["netns"]=1 ["kauditd"]=1
+    ["khungtaskd"]=1 ["oom_reaper"]=1 ["writeback"]=1 ["kcompactd"]=1
+    ["ksmd"]=1 ["khugepaged"]=1 ["kintegrityd"]=1 ["kblockd"]=1
+    ["blkcg_punt_bio"]=1 ["tpm_dev_wq"]=1 ["ata_sff"]=1 ["md"]=1
+    ["edac-poller"]=1 ["devfreq_wq"]=1 ["watchdogd"]=1 ["kswapd"]=1
+    ["kthrotld"]=1 ["irq"]=1 ["acpi_thermal_pm"]=1 ["scsi"]=1
+    ["nvme-wq"]=1 ["nvme-reset-wq"]=1 ["nvme-delete-wq"]=1
+    ["dm_bufio_cache"]=1 ["jbd2"]=1 ["ext4"]=1 ["xfs"]=1
+)
 JSON_MODE=false
+AUTO_EXPORT_JSON=false
 
 #------------------------------------------------------------------------------
 # Detection Functions
@@ -52,8 +69,12 @@ detect_zombies() {
 
     local found=0
     local first=true
-    local uptime_seconds
-    uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+    local uptime_seconds uptime_val
+    if read -r uptime_val _ < /proc/uptime; then
+        uptime_seconds="${uptime_val%%.*}"
+    else
+        uptime_seconds=0
+    fi
     local hz
     hz=$(getconf CLK_TCK)
 
@@ -62,13 +83,21 @@ detect_zombies() {
 
         [[ -r "$proc_dir/status" ]] || continue
 
-        local state
-        state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        local state="" ppid="" key val
+        while IFS=: read -r key val; do
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "State" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                state="${val%%[[:space:]]*}"
+            elif [[ "$key" == "PPid" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                ppid="$val"
+            fi
+        done < "$proc_dir/status"
 
         if [[ "$state" == "Z" ]]; then
-            local name ppid parent_name
+            local name parent_name
             name=$(s9_get_comm "$pid")
-            ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
             parent_name=$(s9_get_comm "$ppid")
 
             # Calculate age
@@ -139,24 +168,34 @@ detect_resource_hogs() {
 
         [[ -r "$proc_dir/status" ]] || continue
 
-        local name rss
+        local rss=0 key val
+        while IFS=: read -r key val; do
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "VmRSS" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                rss="${val%%[[:space:]]*}"
+                break
+            fi
+        done < "$proc_dir/status"
+
+        local name
         name=$(s9_get_comm "$pid")
-        rss=$(awk '/^VmRSS:/ {print $2}' "$proc_dir/status" 2>/dev/null || echo "0")
 
         local mem_percent=0
         if (( rss > 0 )) && (( total_mem > 0 )); then
-            mem_percent=$(echo "scale=1; ($rss * 100) / $total_mem" | s9_calc)
+            # Use native bash math for performance instead of s9_calc forks
+            local mem_int=$(( (rss * 100) / total_mem ))
+            local mem_dec=$(( ((rss * 1000) / total_mem) % 10 ))
+            mem_percent="${mem_int}.${mem_dec}"
         fi
 
-        local fd_count=0
-        if [[ -r "$proc_dir/fd" ]]; then
-            fd_count=$(ls -1 -- "$proc_dir/fd" 2>/dev/null | wc -l)
-        fi
+        local fd_count
+        fd_count=$(s9_get_fd_count "$pid")
 
         local issues=""
         local is_hog=false
 
-        # Check thresholds - compare as integers to avoid bc overhead
+        # Check thresholds - integer portion is enough
         local mem_percent_int=${mem_percent%.*}
         mem_percent_int=${mem_percent_int:-0}
         if (( mem_percent_int > MEM_THRESHOLD_PERCENT )); then
@@ -186,7 +225,7 @@ detect_resource_hogs() {
 
                 # Color based on severity
                 local mem_color="$S9_YELLOW"
-                if (( $(echo "$mem_percent > 90" | s9_calc -l) )); then
+                if (( mem_percent_int > 90 )); then
                     mem_color="$S9_RED"
                 fi
 
@@ -245,8 +284,15 @@ detect_unusual_states() {
 
         [[ -r "$proc_dir/status" ]] || continue
 
-        local state
-        state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        local state="" key val
+        while IFS=: read -r key val; do
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "State" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                state="${val%%[[:space:]]*}"
+                break
+            fi
+        done < "$proc_dir/status"
 
         local is_unusual=false
         local description="" color=""
@@ -335,19 +381,6 @@ detect_orphans() {
     local found=0
     local first=true
 
-    # Known system processes that legitimately have PPID=1
-    local -A system_procs=(
-        ["systemd"]=1 ["init"]=1 ["kthreadd"]=1 ["rcu_gp"]=1 ["rcu_par_gp"]=1
-        ["kworker"]=1 ["migration"]=1 ["cpuhp"]=1 ["netns"]=1 ["kauditd"]=1
-        ["khungtaskd"]=1 ["oom_reaper"]=1 ["writeback"]=1 ["kcompactd"]=1
-        ["ksmd"]=1 ["khugepaged"]=1 ["kintegrityd"]=1 ["kblockd"]=1
-        ["blkcg_punt_bio"]=1 ["tpm_dev_wq"]=1 ["ata_sff"]=1 ["md"]=1
-        ["edac-poller"]=1 ["devfreq_wq"]=1 ["watchdogd"]=1 ["kswapd"]=1
-        ["kthrotld"]=1 ["irq"]=1 ["acpi_thermal_pm"]=1 ["scsi"]=1
-        ["nvme-wq"]=1 ["nvme-reset-wq"]=1 ["nvme-delete-wq"]=1
-        ["dm_bufio_cache"]=1 ["jbd2"]=1 ["ext4"]=1 ["xfs"]=1
-    )
-
     for proc_dir in /proc/[0-9]*; do
         local pid="${proc_dir##*/}"
 
@@ -356,8 +389,17 @@ detect_orphans() {
 
         [[ -r "$proc_dir/status" ]] || continue
 
-        local ppid
-        ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        local ppid="" uid="" key val
+        while IFS=: read -r key val; do
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "PPid" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                ppid="$val"
+            elif [[ "$key" == "Uid" ]]; then
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                uid="${val%%[[:space:]]*}"
+            fi
+        done < "$proc_dir/status"
 
         # Only interested in processes with PPID=1
         [[ "$ppid" == "1" ]] || continue
@@ -366,15 +408,14 @@ detect_orphans() {
         name=$(s9_get_comm "$pid")
 
         # Skip known system processes
-        if [[ -n "${system_procs[$name]:-}" ]]; then continue; fi
+        if [[ -n "${S9_SYSTEM_PROCESSES[$name]:-}" ]]; then continue; fi
 
         # Skip kernel threads (no cmdline)
         local cmdline
         cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
         if [[ -z "$cmdline" ]]; then continue; fi
 
-        local uid user
-        uid=$(awk '/^Uid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+        local user
         user=$(s9_uid_to_user "$uid")
 
         if $JSON_MODE; then
@@ -413,6 +454,106 @@ detect_orphans() {
     fi
 }
 
+detect_gpu_hogs() {
+    local json_last="${1:-true}"
+
+    if $JSON_MODE; then
+        echo "  \"gpu\": ["
+    else
+        s9_header "GPU PROCESSES"
+        printf "  %bThreshold: GPU memory >= %s MB%b\n\n" "${S9_DIM}" "$GPU_THRESHOLD_MB" "${S9_NC}"
+        printf "  ${S9_BOLD}%-8s %-20s %-8s %-10s %s${S9_NC}\n" "PID" "PROCESS" "GPU" "MEMORY" "GPU NAME"
+        printf "  ${S9_DIM}----------------------------------------------------------------${S9_NC}\n"
+    fi
+
+    local found=0
+    local first=true
+
+    if ! s9_gpu_available; then
+        if $JSON_MODE; then
+            echo ""
+            echo "  ],"
+            s9_json_kv "gpu_available" "false"
+            if [[ "$json_last" == "true" ]]; then
+                s9_json_kv "gpu_memory_used_mb" "0" "last"
+            else
+                s9_json_kv "gpu_memory_used_mb" "0"
+            fi
+        else
+            printf "  %bGPU process data unavailable (nvidia-smi not found)%b\n" "${S9_DIM}" "${S9_NC}"
+        fi
+        return 0
+    fi
+
+    local row pid process_name gpu_index gpu_name gpu_memory gpu_type pid_scope
+    local proxy_seen=false
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS='|' read -r pid process_name gpu_index gpu_name gpu_memory gpu_type <<< "$row"
+        [[ "$gpu_memory" =~ ^[0-9]+$ ]] || gpu_memory=0
+        (( gpu_memory >= GPU_THRESHOLD_MB )) || continue
+        pid_scope=$(s9_gpu_pid_scope "$pid" "$process_name")
+        [[ "$pid_scope" == "container_proxy" ]] && proxy_seen=true
+
+        if $JSON_MODE; then
+            if $first; then first=false; else echo ","; fi
+            echo "    {"
+            s9_json_kv "pid" "$pid" "" "    "
+            s9_json_kv "name" "$process_name" "" "    "
+            s9_json_kv "gpu_index" "$gpu_index" "" "    "
+            s9_json_kv "gpu_name" "$gpu_name" "" "    "
+            s9_json_kv "gpu_memory_mb" "$gpu_memory" "" "    "
+            s9_json_kv "pid_scope" "$pid_scope" "" "    "
+            s9_json_kv "gpu_process_type" "${gpu_type:-compute}" "last" "    "
+            echo -n "    }"
+        else
+            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-8s ${S9_YELLOW}%-10s${S9_NC} %s\n" \
+                "$pid" "${process_name:0:20}" "$gpu_index" "${gpu_memory}MB" "${gpu_name:0:28}"
+            [[ "$pid_scope" == "container_proxy" ]] &&
+                printf "  ${S9_DIM}%8s  %s${S9_NC}\n" "" "PID is a container proxy; local workload PID mapping may be unavailable"
+        fi
+
+        ((found++))
+    done < <(s9_gpu_process_rows 2>/dev/null)
+
+    if $JSON_MODE; then
+        echo ""
+        echo "  ],"
+        local mem_used_mb
+        mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+        s9_json_kv "gpu_available" "true"
+        if $proxy_seen; then
+            s9_json_kv "gpu_memory_used_mb" "$mem_used_mb"
+            s9_json_kv "gpu_attribution" "container_proxy"
+            if [[ "$json_last" == "true" ]]; then
+                s9_json_kv "gpu_note" "nvidia-smi reports GPU memory against a container-visible proxy PID; local workload PID mapping may be unavailable" "last"
+            else
+                s9_json_kv "gpu_note" "nvidia-smi reports GPU memory against a container-visible proxy PID; local workload PID mapping may be unavailable"
+            fi
+        else
+            if [[ "$json_last" == "true" ]]; then
+                s9_json_kv "gpu_memory_used_mb" "$mem_used_mb" "last"
+            else
+                s9_json_kv "gpu_memory_used_mb" "$mem_used_mb"
+            fi
+        fi
+    else
+        echo ""
+        if (( found == 0 )); then
+            local mem_used_mb
+            mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+            if (( mem_used_mb >= GPU_THRESHOLD_MB && mem_used_mb > 100 )); then
+                printf "  %bGPU memory in use (%sMB) but no local process rows are visible%b\n" "${S9_YELLOW}" "$mem_used_mb" "${S9_NC}"
+                printf "  %b(process enumeration may be unavailable due to container isolation)%b\n" "${S9_DIM}" "${S9_NC}"
+            else
+                printf "  %bNo GPU processes above threshold%b\n" "${S9_GREEN}" "${S9_NC}"
+            fi
+        else
+            printf "  %b! Found %d GPU process(es) above threshold%b\n" "${S9_YELLOW}" "$found" "${S9_NC}"
+        fi
+    fi
+}
+
 #------------------------------------------------------------------------------
 # Summary Report
 #------------------------------------------------------------------------------
@@ -423,7 +564,8 @@ run_all_checks() {
         detect_zombies false
         detect_resource_hogs false
         detect_unusual_states false
-        detect_orphans true
+        detect_orphans false
+        detect_gpu_hogs true
         echo "}"
     else
         detect_zombies
@@ -433,6 +575,8 @@ run_all_checks() {
         detect_unusual_states
         echo ""
         detect_orphans
+        echo ""
+        detect_gpu_hogs
     fi
 }
 
@@ -453,28 +597,106 @@ ${S9_BOLD}OPTIONS:${S9_NC}
     --hogs              Check for resource hogs only
     --states            Check for unusual process states only
     --orphans           Check for orphan processes only
+    --gpu               Check GPU processes only (uses nvidia-smi if available)
     --mem-threshold N   Memory threshold percentage (default: 80)
     --fd-threshold N    FD count threshold (default: 500)
+    --gpu-threshold N   GPU memory threshold in MB (default: 1024)
     -j, --json          Output in JSON format
+    -e, --export-json   Export JSON to an auto-named file
     -q, --quiet         Minimal output (for scripting)
     -h, --help          Show this help
-    -v, --version       Show version
+
 
 ${S9_BOLD}CHECKS PERFORMED:${S9_NC}
     Zombies     - Dead processes waiting for parent to reap
     Hogs        - Processes using excessive memory or FDs
     States      - Processes in D (disk sleep), T (stopped), etc.
     Orphans     - User processes adopted by init
+    GPU         - Optional NVIDIA GPU process memory visibility
 
 ${S9_BOLD}EXAMPLES:${S9_NC}
     s9-anomaly                          # Run all checks
     s9-anomaly --zombies                # Only check for zombies
     s9-anomaly --hogs --mem-threshold 50
     s9-anomaly --fd-threshold 100       # Lower FD threshold
+    s9-anomaly --gpu --gpu-threshold 2048
     s9-anomaly --json | jq .            # Output as JSON
 
 EOF
     exit 0
+}
+
+anomaly_export_purpose() {
+    if $CHECK_ALL; then
+        echo "anomaly-all"
+        return
+    fi
+
+    local -a selected=()
+    $CHECK_ZOMBIES && selected+=(zombies)
+    $CHECK_HOGS && selected+=(hogs)
+    $CHECK_STATES && selected+=(states)
+    $CHECK_ORPHANS && selected+=(orphans)
+    $CHECK_GPU && selected+=(gpu)
+
+    local joined="anomaly"
+    local item
+    for item in "${selected[@]}"; do
+        joined+="-${item}"
+    done
+
+    echo "$joined"
+}
+
+run_anomaly_checks() {
+    if ! $JSON_MODE; then
+        s9_box_title "Substrata9 - Anomaly Detection" "System health scan"
+    fi
+
+    if $CHECK_ALL; then
+        run_all_checks
+    else
+        if $JSON_MODE; then
+            echo "{"
+            local -a selected=()
+            $CHECK_ZOMBIES && selected+=(zombies)
+            $CHECK_HOGS && selected+=(hogs)
+            $CHECK_STATES && selected+=(states)
+            $CHECK_ORPHANS && selected+=(orphans)
+            $CHECK_GPU && selected+=(gpu)
+
+            local idx check is_last
+            for idx in "${!selected[@]}"; do
+                check="${selected[$idx]}"
+                is_last=false
+                if (( idx == ${#selected[@]} - 1 )); then
+                    is_last=true
+                fi
+
+                case "$check" in
+                    zombies) detect_zombies "$is_last" ;;
+                    hogs) detect_resource_hogs "$is_last" ;;
+                    states) detect_unusual_states "$is_last" ;;
+                    orphans) detect_orphans "$is_last" ;;
+                    gpu) detect_gpu_hogs "$is_last" ;;
+                esac
+            done
+            echo "}"
+        else
+            $CHECK_ZOMBIES && { detect_zombies; echo ""; }
+            $CHECK_HOGS && { detect_resource_hogs; echo ""; }
+            $CHECK_STATES && { detect_unusual_states; echo ""; }
+            $CHECK_ORPHANS && { detect_orphans; echo ""; }
+            $CHECK_GPU && { detect_gpu_hogs; echo ""; }
+        fi
+    fi
+
+    if ! $JSON_MODE; then
+        echo ""
+        s9_rule
+        printf "  %bScan completed at %s | Substrata9 v%s%b\n" "${S9_DIM}" "$(date '+%Y-%m-%d %H:%M:%S')" "$S9_VERSION" "${S9_NC}"
+        echo ""
+    fi
 }
 
 main() {
@@ -501,19 +723,35 @@ main() {
                 CHECK_ALL=false
                 shift
                 ;;
+            --gpu)
+                CHECK_GPU=true
+                CHECK_ALL=false
+                shift
+                ;;
             --mem-threshold)
                 [[ $# -ge 2 ]] || s9_die "--mem-threshold requires a value"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Memory threshold must be a number"
-                MEM_THRESHOLD_PERCENT="$2"
+                MEM_THRESHOLD_PERCENT=$((10#$2))
                 shift 2
                 ;;
             --fd-threshold)
                 [[ $# -ge 2 ]] || s9_die "--fd-threshold requires a value"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "FD threshold must be a number"
-                FD_THRESHOLD="$2"
+                FD_THRESHOLD=$((10#$2))
+                shift 2
+                ;;
+            --gpu-threshold)
+                [[ $# -ge 2 ]] || s9_die "--gpu-threshold requires a value"
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "GPU threshold must be a number"
+                GPU_THRESHOLD_MB=$((10#$2))
                 shift 2
                 ;;
             -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
                 JSON_MODE=true
                 shift
                 ;;
@@ -524,87 +762,97 @@ main() {
             -h|--help)
                 usage
                 ;;
-            -v|--version)
-                echo "s9-anomaly version $S9_VERSION"
-                exit 0
-                ;;
+
             *)
                 s9_die "Unknown option: $1. Use --help for usage."
                 ;;
         esac
     done
 
-    # Run environment checks after handling cheap flags like --help/--version.
+    if $AUTO_EXPORT_JSON && $QUIET_MODE; then
+        s9_die "-e cannot be combined with --quiet"
+    fi
+
+    # Run environment checks after handling cheap flags like --help.
     s9_init
 
     # Quiet mode: count issues only
     if $QUIET_MODE; then
-        local zombies=0 hogs=0 unusual=0 orphans=0
+        local zombies=0 hogs=0 unusual=0 orphans=0 gpu_processes=0
+        local total_mem
+        total_mem=$(s9_get_total_mem)
+
+        local do_zombies=false do_hogs=false do_states=false do_orphans=false do_gpu=false
+        if $CHECK_ALL || $CHECK_ZOMBIES; then do_zombies=true; fi
+        if $CHECK_ALL || $CHECK_HOGS; then do_hogs=true; fi
+        if $CHECK_ALL || $CHECK_STATES; then do_states=true; fi
+        if $CHECK_ALL || $CHECK_ORPHANS; then do_orphans=true; fi
+        if $CHECK_ALL || $CHECK_GPU; then do_gpu=true; fi
 
         for proc_dir in /proc/[0-9]*; do
             local pid="${proc_dir##*/}"
             [[ -r "$proc_dir/status" ]] || continue
 
-            local state
-            state=$(awk '/^State:/ {print $2}' "$proc_dir/status" 2>/dev/null)
-            if [[ "$state" == "Z" ]]; then ((zombies++)); fi
-            if [[ "$state" =~ ^[DTtX]$ ]]; then ((unusual++)); fi
+            local state="" rss=0 ppid="" key val
+            while IFS=: read -r key val; do
+                key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                case "$key" in
+                    State)   state="${val%%[[:space:]]*}" ;;
+                    VmRSS)   rss="${val%%[[:space:]]*}" ;;
+                    PPid)    ppid="$val" ;;
+                esac
+            done < "$proc_dir/status"
 
-            local ppid
-            ppid=$(awk '/^PPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
-            if [[ "$ppid" == "1" ]] && [[ "$pid" != "1" ]]; then ((orphans++)); fi
+            if $do_zombies && [[ "$state" == "Z" ]]; then ((zombies++)); fi
+            if $do_states && [[ "$state" =~ ^[DTtX]$ ]]; then ((unusual++)); fi
+
+            if $do_hogs; then
+                [[ "$rss" =~ ^[0-9]+$ ]] || rss=0
+                local mem_percent_int=0
+                if (( rss > 0 && total_mem > 0 )); then
+                    mem_percent_int=$(( (rss * 100) / total_mem ))
+                fi
+
+                local fd_count
+                fd_count=$(s9_get_fd_count "$pid")
+                if (( mem_percent_int > MEM_THRESHOLD_PERCENT || fd_count > FD_THRESHOLD )); then
+                    ((hogs++))
+                fi
+            fi
+
+            if $do_orphans; then
+                if [[ "$ppid" == "1" ]] && [[ "$pid" != "1" ]]; then
+                    # Apply same filters as detect_orphans: skip system procs and kernel threads
+                    local _q_name
+                    _q_name=$(s9_get_comm "$pid")
+                    if [[ -z "${S9_SYSTEM_PROCESSES[$_q_name]:-}" ]]; then
+                        local _q_cmdline
+                        _q_cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
+                        if [[ -n "$_q_cmdline" ]]; then
+                            ((orphans++))
+                        fi
+                    fi
+                fi
+            fi
         done
 
-        echo "ZOMBIES=$zombies UNUSUAL_STATES=$unusual ORPHANS=$orphans"
+        if $do_gpu && s9_gpu_available; then
+            gpu_processes=$(s9_gpu_process_rows 2>/dev/null | awk -F'|' -v threshold="$GPU_THRESHOLD_MB" '$5 >= threshold {count++} END {print count + 0}') || gpu_processes=0
+        fi
+        echo "ZOMBIES=$zombies HOGS=$hogs UNUSUAL_STATES=$unusual ORPHANS=$orphans GPU_PROCESSES=$gpu_processes"
         return 0
     fi
 
-    if ! $JSON_MODE; then
-        s9_box_title "Substrata9 — Anomaly Detection" "System health scan"
-    fi
-
-    # Run checks
-    if $CHECK_ALL; then
-        run_all_checks
+    if $AUTO_EXPORT_JSON; then
+        local export_file
+        export_file=$(s9_auto_export_path "$(anomaly_export_purpose)")
+        s9_export_json_output "$export_file" run_anomaly_checks
     else
-        if $JSON_MODE; then
-            echo "{"
-            local -a selected=()
-            $CHECK_ZOMBIES && selected+=(zombies)
-            $CHECK_HOGS && selected+=(hogs)
-            $CHECK_STATES && selected+=(states)
-            $CHECK_ORPHANS && selected+=(orphans)
-
-            local idx check is_last
-            for idx in "${!selected[@]}"; do
-                check="${selected[$idx]}"
-                is_last=false
-                if (( idx == ${#selected[@]} - 1 )); then
-                    is_last=true
-                fi
-
-                case "$check" in
-                    zombies) detect_zombies "$is_last" ;;
-                    hogs) detect_resource_hogs "$is_last" ;;
-                    states) detect_unusual_states "$is_last" ;;
-                    orphans) detect_orphans "$is_last" ;;
-                esac
-            done
-            echo "}"
-        else
-            $CHECK_ZOMBIES && { detect_zombies; echo ""; }
-            $CHECK_HOGS && { detect_resource_hogs; echo ""; }
-            $CHECK_STATES && { detect_unusual_states; echo ""; }
-            $CHECK_ORPHANS && { detect_orphans; echo ""; }
-        fi
+        run_anomaly_checks
     fi
+    return 0
 
-    if ! $JSON_MODE; then
-        echo ""
-        s9_rule
-        printf "  %bScan completed at %s │ Substrata9 v%s%b\n" "${S9_DIM}" "$(date '+%Y-%m-%d %H:%M:%S')" "$S9_VERSION" "${S9_NC}"
-        echo ""
-    fi
 }
 
 main "$@"

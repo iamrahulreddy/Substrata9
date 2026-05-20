@@ -19,6 +19,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/s9-common.sh
 source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
@@ -27,6 +28,10 @@ source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 #------------------------------------------------------------------------------
 SNAPSHOT_DIR=""
 JSON_MODE=false
+AUTO_EXPORT_JSON=false
+S9_RESOLVED_SNAPSHOT=""
+declare -a S9_SNAPSHOT_MATCHES=()
+declare -a S9_DELETE_SNAPSHOTS=()
 
 #------------------------------------------------------------------------------
 # Snapshot Functions
@@ -47,29 +52,120 @@ resolve_snapshot_dir() {
 
 ensure_snapshot_dir() {
     resolve_snapshot_dir
+    local existed=false
+    [[ -d "$SNAPSHOT_DIR" ]] && existed=true
+
     mkdir -p "$SNAPSHOT_DIR" || s9_die "Cannot create snapshot directory: $SNAPSHOT_DIR"
-    chmod 700 "$SNAPSHOT_DIR" 2>/dev/null || true
+
+    # Do not chmod pre-existing custom directories such as /tmp.
+    if ! $existed || [[ -z "${S9_SNAPSHOT_DIR:-}" ]]; then
+        chmod 700 "$SNAPSHOT_DIR" 2>/dev/null || true
+    fi
 }
 
-latest_snapshot_for_name() {
-    local snap_name="$1"
-    local -a snaps=()
+collect_snapshot_matches() {
+    local ref="$1"
+    S9_SNAPSHOT_MATCHES=()
 
-    shopt -s nullglob
-    snaps=( "$SNAPSHOT_DIR/${snap_name}"_*.snap )
-    shopt -u nullglob
+    if [[ "$ref" == */* ]] || [[ "$ref" == *\\* ]]; then
+        s9_die "Snapshot reference must be a snapshot name or basename, not a path"
+    fi
+    if ! [[ "$ref" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        s9_die "Invalid snapshot reference: $ref"
+    fi
 
-    (( ${#snaps[@]} > 0 )) || return 1
+    if [[ "$ref" == *.snap && -f "$SNAPSHOT_DIR/$ref" ]]; then
+        S9_SNAPSHOT_MATCHES+=( "$SNAPSHOT_DIR/$ref" )
+        return 0
+    fi
+    [[ "$ref" == *.snap ]] && return 0
 
-    local latest="${snaps[0]}"
+    local snap restore_nullglob=false
+    if ! shopt -q nullglob; then
+        restore_nullglob=true
+        shopt -s nullglob
+    fi
+    for snap in "$SNAPSHOT_DIR/${ref}"_*.snap; do
+        S9_SNAPSHOT_MATCHES+=( "$snap" )
+    done
+    $restore_nullglob && shopt -u nullglob
+}
+
+latest_snapshot_from_list() {
+    local latest="$1"
+    shift
+
     local snap
-    for snap in "${snaps[@]}"; do
+    for snap in "$@"; do
         if [[ "$snap" -nt "$latest" ]]; then
             latest="$snap"
         fi
     done
 
     printf "%s\n" "$latest"
+}
+
+resolve_snapshot_ref() {
+    local ref="$1"
+    local allow_latest="${2:-false}"
+    S9_RESOLVED_SNAPSHOT=""
+
+    collect_snapshot_matches "$ref"
+
+    if (( ${#S9_SNAPSHOT_MATCHES[@]} == 0 )); then
+        s9_die "Snapshot '$ref' not found"
+    fi
+
+    if (( ${#S9_SNAPSHOT_MATCHES[@]} == 1 )); then
+        S9_RESOLVED_SNAPSHOT="${S9_SNAPSHOT_MATCHES[0]}"
+        return 0
+    fi
+
+    if [[ "$allow_latest" == "true" ]]; then
+        S9_RESOLVED_SNAPSHOT=$(latest_snapshot_from_list "${S9_SNAPSHOT_MATCHES[@]}")
+        return 0
+    fi
+
+    s9_warn "Multiple snapshots match '$ref':"
+    local snap
+    for snap in "${S9_SNAPSHOT_MATCHES[@]}"; do
+        printf "  %s\n" "$(basename "$snap")" >&2
+    done
+    s9_die "Use an exact .snap basename or pass --latest"
+}
+
+resolve_snapshot_delete_set() {
+    local ref="$1"
+    local mode="${2:-single}"
+    S9_DELETE_SNAPSHOTS=()
+
+    collect_snapshot_matches "$ref"
+
+    if (( ${#S9_SNAPSHOT_MATCHES[@]} == 0 )); then
+        s9_die "Snapshot '$ref' not found"
+    fi
+
+    if [[ "$mode" == "all" ]]; then
+        S9_DELETE_SNAPSHOTS=( "${S9_SNAPSHOT_MATCHES[@]}" )
+        return 0
+    fi
+
+    if (( ${#S9_SNAPSHOT_MATCHES[@]} == 1 )); then
+        S9_DELETE_SNAPSHOTS=( "${S9_SNAPSHOT_MATCHES[0]}" )
+        return 0
+    fi
+
+    if [[ "$mode" == "latest" ]]; then
+        S9_DELETE_SNAPSHOTS=( "$(latest_snapshot_from_list "${S9_SNAPSHOT_MATCHES[@]}")" )
+        return 0
+    fi
+
+    s9_warn "Multiple snapshots match '$ref':"
+    local snap
+    for snap in "${S9_SNAPSHOT_MATCHES[@]}"; do
+        printf "  %s\n" "$(basename "$snap")" >&2
+    done
+    s9_die "Use an exact .snap basename, --latest, or --all"
 }
 
 capture_snapshot() {
@@ -95,7 +191,9 @@ capture_snapshot() {
 
     local timestamp
     timestamp=$(date '+%Y%m%d_%H%M%S')
-    local snap_file="$SNAPSHOT_DIR/${snap_name}_${pid}_${timestamp}.snap"
+    local snap_file
+    snap_file=$(mktemp "$SNAPSHOT_DIR/${snap_name}_${pid}_${timestamp}_XXXXXX.snap") || \
+        s9_die "Cannot create snapshot file in $SNAPSHOT_DIR"
 
     if ! $JSON_MODE; then
         s9_info "Capturing snapshot of PID $pid..."
@@ -161,7 +259,7 @@ capture_snapshot() {
             echo "ERROR: Cannot read maps"
         fi
 
-    } > "$snap_file"
+    } > "$snap_file" || s9_die "Cannot write snapshot file: $snap_file"
 
     if $JSON_MODE; then
         echo "{"
@@ -212,34 +310,30 @@ list_snapshots() {
         [[ -f "$snap" ]] || continue
 
         local basename="${snap##*/}"
-        # Parse filename: name_pid_YYYYMMDD_HHMMSS.snap
-        # The timestamp has format YYYYMMDD_HHMMSS (with underscore)
-        # So we extract from the right: _HHMMSS, _YYYYMMDD, _pid, then rest is name
+        # Parse filename: name_pid_YYYYMMDD_HHMMSS[_unique].snap
         local name pid timestamp
 
         # Remove .snap extension
         local noext="${basename%.snap}"
 
-        # Extract parts from the right (timestamp has underscore so it's 2 parts)
-        local hhmmss="${noext##*_}"
-        local rest1="${noext%_*}"
-        local yyyymmdd="${rest1##*_}"
-        local rest2="${rest1%_*}"
-        pid="${rest2##*_}"
-        name="${rest2%_*}"
-
-        # Combine timestamp
-        timestamp="${yyyymmdd}_${hhmmss}"
+        if [[ "$noext" =~ ^(.+)_([0-9]+)_([0-9]{8})_([0-9]{6})(_[A-Za-z0-9]+)?$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            pid="${BASH_REMATCH[2]}"
+            timestamp="${BASH_REMATCH[3]}_${BASH_REMATCH[4]}"
+        else
+            name="$noext"
+            pid="?"
+            timestamp=""
+        fi
 
         # Format timestamp (YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM)
         local formatted=""
-        if [[ ${#timestamp} -ge 15 ]]; then
+        if [[ "$timestamp" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
             local year=${timestamp:0:4}
             local month=${timestamp:4:2}
             local day=${timestamp:6:2}
             local hour=${timestamp:9:2}
             local min=${timestamp:11:2}
-            local sec=${timestamp:13:2}
             formatted="$year-$month-$day $hour:$min"
         else
             formatted="$timestamp"
@@ -276,21 +370,17 @@ list_snapshots() {
 diff_snapshots() {
     local snap1_name=$1
     local snap2_name=$2
-
-    # Sanitize snapshot names
-    snap1_name="${snap1_name//[^a-zA-Z0-9_-]/}"
-    snap2_name="${snap2_name//[^a-zA-Z0-9_-]/}"
+    local use_latest="${3:-false}"
 
     [[ -n "$snap1_name" ]] || s9_die "Invalid snapshot name"
     [[ -n "$snap2_name" ]] || s9_die "Invalid snapshot name"
 
-    # Find most recent snapshot matching each name
+    # Resolve references. Plain names must be unambiguous unless --latest is used.
     local snap1 snap2
-    snap1=$(latest_snapshot_for_name "$snap1_name") || true
-    snap2=$(latest_snapshot_for_name "$snap2_name") || true
-
-    [[ -f "$snap1" ]] || s9_die "Snapshot '$snap1_name' not found"
-    [[ -f "$snap2" ]] || s9_die "Snapshot '$snap2_name' not found"
+    resolve_snapshot_ref "$snap1_name" "$use_latest"
+    snap1="$S9_RESOLVED_SNAPSHOT"
+    resolve_snapshot_ref "$snap2_name" "$use_latest"
+    snap2="$S9_RESOLVED_SNAPSHOT"
 
     # Validate snapshot format
     grep -q "^# Substrata9 Process Snapshot" "$snap1" || s9_die "Invalid snapshot format: $snap1"
@@ -536,19 +626,13 @@ diff_snapshots() {
 delete_snapshot() {
     local snap_name=$1
     local force_delete=${2:-false}
+    local delete_mode="${3:-single}"
 
-    # Sanitize snapshot name
-    snap_name="${snap_name//[^a-zA-Z0-9_-]/}"
     [[ -n "$snap_name" ]] || s9_die "Invalid snapshot name"
 
     local -a snaps=()
-    shopt -s nullglob
-    snaps=( "$SNAPSHOT_DIR/${snap_name}"_*.snap )
-    shopt -u nullglob
-
-    if (( ${#snaps[@]} == 0 )); then
-        s9_die "No snapshots found matching '$snap_name'"
-    fi
+    resolve_snapshot_delete_set "$snap_name" "$delete_mode"
+    snaps=( "${S9_DELETE_SNAPSHOTS[@]}" )
 
     local count
     count=${#snaps[@]}
@@ -596,8 +680,8 @@ usage() {
     printf "%bUSAGE:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    s9-snapshot capture <PID> --name <name>\n"
     printf "    s9-snapshot list\n"
-    printf "    s9-snapshot diff <name1> <name2>\n"
-    printf "    s9-snapshot delete <name> [--force]\n\n"
+    printf "    s9-snapshot diff <name1|file.snap> <name2|file.snap> [--latest]\n"
+    printf "    s9-snapshot delete <name|file.snap> [--latest|--all] [--force]\n\n"
 
     printf "%bCOMMANDS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    capture    Capture process state snapshot\n"
@@ -608,24 +692,27 @@ usage() {
     printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    --name NAME    Name for the snapshot (required for capture)\n"
     printf "    --force, -y    Skip confirmation prompt (for delete)\n"
+    printf "    --latest      Use/delete newest match when a snapshot name is ambiguous\n"
+    printf "    --all         Delete all snapshots matching a name\n"
     printf "    -j, --json     Output in JSON format (for list, diff, capture result)\n"
+    printf "    -e, --export-json  Export JSON to an auto-named file\n"
     printf "    -h, --help     Show this help\n"
-    printf "    -v, --version  Show version\n\n"
+
 
     printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    # Capture before and after states\n"
-    printf "    s9-snapshot capture \$(pgrep myapp) --name before_test\n"
+    printf "    s9-snapshot capture \$(pgrep -n -x myapp) --name before_test\n"
     printf "    # ... run test ...\n"
-    printf "    s9-snapshot capture \$(pgrep myapp) --name after_test\n"
+    printf "    s9-snapshot capture \$(pgrep -n -x myapp) --name after_test\n"
     printf "\n"
     printf "    # Compare the snapshots\n"
-    printf "    s9-snapshot diff before_test after_test\n"
+    printf "    s9-snapshot diff before_test after_test --latest\n"
     printf "\n"
     printf "    # List all snapshots\n"
     printf "    s9-snapshot list\n"
     printf "\n"
-    printf "    # Clean up\n"
-    printf "    s9-snapshot delete before_test\n\n"
+    printf "    # Clean up the newest matching snapshot without prompting\n"
+    printf "    s9-snapshot delete before_test --latest --force\n\n"
 
     printf "%bENVIRONMENT:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    S9_SNAPSHOT_DIR    Override snapshot directory (default: ~/.substrata9/snapshots)\n"
@@ -636,89 +723,208 @@ usage() {
 main() {
     [[ $# -eq 0 ]] && usage
 
-    local command="$1"
-    shift
-
-    # Check for global flags before command specific args
-    # This is a bit hacky but works for simple flags
-    local args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -j|--json)
                 JSON_MODE=true
                 shift
                 ;;
-            *)
-                args+=("$1")
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
+                JSON_MODE=true
                 shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
                 ;;
         esac
     done
-    set -- "${args[@]}"
+
+    [[ $# -gt 0 ]] || usage
+    local command="$1"
+    shift
 
     case "$command" in
         capture)
-            [[ $# -ge 1 ]] || s9_die "Usage: s9-snapshot capture <PID> --name <name>"
-            local pid="$1"
-            shift
-
+            local pid=""
             local snap_name=""
             while [[ $# -gt 0 ]]; do
                 case "$1" in
+                    -j|--json)
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -e|--export-json)
+                        AUTO_EXPORT_JSON=true
+                        JSON_MODE=true
+                        shift
+                        ;;
                     --name|-n)
                         [[ $# -ge 2 ]] || s9_die "--name requires a snapshot name"
                         snap_name="$2"
                         shift 2
                         ;;
+                    -h|--help)
+                        usage
+                        ;;
+                    -*)
+                        s9_die "Unknown option: $1"
+                        ;;
+                    *)
+                        [[ -z "$pid" ]] || s9_die "Too many arguments. Expected one PID."
+                        pid="$1"
+                        shift
+                        ;;
+                esac
+            done
+
+            [[ -n "$pid" ]] || s9_die "Usage: s9-snapshot capture <PID> --name <name>"
+            [[ -n "$snap_name" ]] || s9_die "Snapshot name required (--name)"
+            s9_init
+            ensure_snapshot_dir
+            if $AUTO_EXPORT_JSON; then
+                local export_file
+                export_file=$(s9_auto_export_path "snapshot-capture")
+                s9_export_json_output "$export_file" capture_snapshot "$pid" "$snap_name"
+            else
+                capture_snapshot "$pid" "$snap_name"
+            fi
+            ;;
+        list)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -j|--json)
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -e|--export-json)
+                        AUTO_EXPORT_JSON=true
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -h|--help)
+                        usage
+                        ;;
                     *)
                         s9_die "Unknown option: $1"
                         ;;
                 esac
             done
 
-            [[ -n "$snap_name" ]] || s9_die "Snapshot name required (--name)"
-            s9_init
-            ensure_snapshot_dir
-            capture_snapshot "$pid" "$snap_name"
-            ;;
-        list)
             s9_init
             resolve_snapshot_dir
-            list_snapshots
+            if $AUTO_EXPORT_JSON; then
+                local export_file
+                export_file=$(s9_auto_export_path "snapshot-list")
+                s9_export_json_output "$export_file" list_snapshots
+            else
+                list_snapshots
+            fi
             ;;
         diff)
-            [[ $# -eq 2 ]] || s9_die "Usage: s9-snapshot diff <name1> <name2>"
-            s9_init
-            resolve_snapshot_dir
-            diff_snapshots "$1" "$2"
-            ;;
-        delete|rm)
-            [[ $# -ge 1 ]] || s9_die "Usage: s9-snapshot delete <name> [--force]"
-            local del_name="$1"
-            shift
-            local force_flag=false
+            local -a diff_names=()
+            local diff_latest=false
             while [[ $# -gt 0 ]]; do
                 case "$1" in
+                    -j|--json)
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -e|--export-json)
+                        AUTO_EXPORT_JSON=true
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -h|--help)
+                        usage
+                        ;;
+                    --latest)
+                        diff_latest=true
+                        shift
+                        ;;
+                    -*)
+                        s9_die "Unknown option: $1"
+                        ;;
+                    *)
+                        diff_names+=("$1")
+                        shift
+                        ;;
+                esac
+            done
+
+            [[ ${#diff_names[@]} -eq 2 ]] || s9_die "Usage: s9-snapshot diff <name1|file.snap> <name2|file.snap> [--latest]"
+            s9_init
+            resolve_snapshot_dir
+            if $AUTO_EXPORT_JSON; then
+                local export_file
+                export_file=$(s9_auto_export_path "snapshot-diff")
+                s9_export_json_output "$export_file" diff_snapshots "${diff_names[0]}" "${diff_names[1]}" "$diff_latest"
+            else
+                diff_snapshots "${diff_names[0]}" "${diff_names[1]}" "$diff_latest"
+            fi
+            ;;
+        delete|rm)
+            local del_name=""
+            local force_flag=false
+            local delete_mode="single"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -j|--json)
+                        JSON_MODE=true
+                        shift
+                        ;;
+                    -e|--export-json)
+                        AUTO_EXPORT_JSON=true
+                        JSON_MODE=true
+                        shift
+                        ;;
                     --force|-y)
                         force_flag=true
                         shift
                         ;;
-                    *)
+                    --latest)
+                        [[ "$delete_mode" == "all" ]] && s9_die "--latest cannot be combined with --all"
+                        delete_mode="latest"
+                        shift
+                        ;;
+                    --all)
+                        [[ "$delete_mode" == "latest" ]] && s9_die "--all cannot be combined with --latest"
+                        delete_mode="all"
+                        shift
+                        ;;
+                    -h|--help)
+                        usage
+                        ;;
+                    -*)
                         s9_die "Unknown option: $1"
+                        ;;
+                    *)
+                        [[ -z "$del_name" ]] || s9_die "Too many arguments. Expected one snapshot name."
+                        del_name="$1"
+                        shift
                         ;;
                 esac
             done
+            [[ -n "$del_name" ]] || s9_die "Usage: s9-snapshot delete <name|file.snap> [--latest|--all] [--force]"
+
             s9_init
             resolve_snapshot_dir
-            delete_snapshot "$del_name" "$force_flag"
+            if $AUTO_EXPORT_JSON; then
+                local export_file
+                export_file=$(s9_auto_export_path "snapshot-delete")
+                s9_export_json_output "$export_file" delete_snapshot "$del_name" "$force_flag" "$delete_mode"
+            else
+                delete_snapshot "$del_name" "$force_flag" "$delete_mode"
+            fi
             ;;
-        -h|--help)
-            usage
-            ;;
-        -v|--version)
-            echo "s9-snapshot version $S9_VERSION"
-            exit 0
-            ;;
+
         *)
             s9_die "Unknown command: $command. Use --help for usage."
             ;;

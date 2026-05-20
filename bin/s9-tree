@@ -33,22 +33,21 @@ SHOW_MEMORY=true
 SHOW_STATE=true
 JSON_MODE=false
 EXPORT_FILE=""
+AUTO_EXPORT_JSON=false
 
 #------------------------------------------------------------------------------
 # Data Collection
 #------------------------------------------------------------------------------
 
 declare -A PROC_NAME
-declare -A PROC_PPID
 declare -A PROC_STATE
 declare -A PROC_RSS
 declare -A PROC_USER
 declare -A PROC_THREADS
 declare -A PROC_CHILDREN
-declare -A PROC_CONTAINER
 
 collect_process_data() {
-    local pid ppid name state rss user threads container
+    local pid ppid name state rss user threads uid key val
 
     for proc_dir in /proc/[0-9]*; do
         pid="${proc_dir##*/}"
@@ -56,37 +55,43 @@ collect_process_data() {
         # Skip if we can't read it
         [[ -r "$proc_dir/status" ]] || continue
 
-        # Read status file once for efficiency
-        local status_content
-        status_content=$(cat "$proc_dir/status" 2>/dev/null) || continue
+        name="" ppid="" state="" rss=0 threads=1 uid=""
 
-        name=$(s9_sanitize_display "$(echo "$status_content" | awk '/^Name:/ {print $2}')")
-        ppid=$(echo "$status_content" | awk '/^PPid:/ {print $2}')
-        state=$(echo "$status_content" | awk '/^State:/ {print $2}')
-        rss=$(echo "$status_content" | awk '/^VmRSS:/ {print $2}')
-        threads=$(echo "$status_content" | awk '/^Threads:/ {print $2}')
+        while IFS=: read -r key val; do
+            # Trim leading/trailing whitespace
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
 
-        # Get UID and convert to username
-        local uid
-        uid=$(echo "$status_content" | awk '/^Uid:/ {print $2}')
+            case "$key" in
+                Name)
+                    name=$(s9_sanitize_display "$val")
+                    ;;
+                PPid)
+                    ppid="$val"
+                    ;;
+                State)
+                    state="${val%%[[:space:]]*}"
+                    ;;
+                VmRSS)
+                    rss="${val%%[[:space:]]*}"
+                    ;;
+                Threads)
+                    threads="$val"
+                    ;;
+                Uid)
+                    uid="${val%%[[:space:]]*}"
+                    ;;
+            esac
+        done < "$proc_dir/status"
+
         user=$(s9_uid_to_user "$uid")
-
-        # Check container status (only if requested or in JSON mode, as it's expensive)
-        # For tree view, we might want to optimize this
-        if $JSON_MODE; then
-             container=$(s9_check_namespace "$pid")
-        else
-             container=""
-        fi
 
         # Store data
         PROC_NAME[$pid]="$name"
-        PROC_PPID[$pid]="$ppid"
         PROC_STATE[$pid]="$state"
         PROC_RSS[$pid]="${rss:-0}"
         PROC_USER[$pid]="$user"
         PROC_THREADS[$pid]="${threads:-1}"
-        PROC_CONTAINER[$pid]="$container"
 
         # Build children list
         if [[ -n "$ppid" ]] && [[ "$ppid" != "0" ]]; then
@@ -123,7 +128,8 @@ print_process() {
             for child in "${child_array[@]}"; do
                 [[ -z "$child" ]] && continue
                 ((i++))
-                local child_is_last=$( (( i == count )) && echo true || echo false )
+                local child_is_last
+                child_is_last=$( (( i == count )) && echo true || echo false )
                 print_process "$child" "$prefix" "$child_is_last" $((depth + 1))
             done
         fi
@@ -160,9 +166,13 @@ print_process() {
     local mem_str=""
     if $SHOW_MEMORY && (( rss > 0 )); then
         if (( rss >= 1048576 )); then
-            mem_str=$(printf "%.1fG" "$(echo "scale=1; $rss/1048576" | s9_calc)")
+            local int_val=$(( rss / 1048576 ))
+            local dec_val=$(( (rss * 10 / 1048576) % 10 ))
+            mem_str="${int_val}.${dec_val}G"
         elif (( rss >= 1024 )); then
-            mem_str=$(printf "%.1fM" "$(echo "scale=1; $rss/1024" | s9_calc)")
+            local int_val=$(( rss / 1024 ))
+            local dec_val=$(( (rss * 10 / 1024) % 10 ))
+            mem_str="${int_val}.${dec_val}M"
         else
             mem_str="${rss}K"
         fi
@@ -207,7 +217,8 @@ print_process() {
         for child in "${child_array[@]}"; do
             [[ -z "$child" ]] && continue
             ((i++))
-            local child_is_last=$( (( i == count )) && echo true || echo false )
+            local child_is_last
+            child_is_last=$( (( i == count )) && echo true || echo false )
             print_process "$child" "$new_prefix" "$child_is_last" $((depth + 1))
         done
     fi
@@ -244,7 +255,6 @@ print_json_tree() {
     local rss="${PROC_RSS[$pid]:-0}"
     local user="${PROC_USER[$pid]:-?}"
     local threads="${PROC_THREADS[$pid]:-1}"
-    local container="${PROC_CONTAINER[$pid]:-}"
 
     echo "{"
     s9_json_kv "pid" "$pid"
@@ -253,7 +263,6 @@ print_json_tree() {
     s9_json_kv "rss_kb" "$rss"
     s9_json_kv "user" "$user"
     s9_json_kv "threads" "$threads"
-    s9_json_kv "container" "$container"
 
     printf "  \"children\": [\n"
 
@@ -341,14 +350,15 @@ usage() {
     printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    -p, --pid PID       Start tree from specific PID (default: 1)\n"
     printf "    -u, --user USER     Show only processes owned by USER\n"
-    printf "    -d, --depth N       Maximum tree depth (default: unlimited)\n"
+    printf "    -d, --depth N       Maximum tree depth (default: 100)\n"
     printf "    -t, --threads       Show thread count for each process\n"
     printf "    -j, --json          Output in JSON format\n"
+    printf "    -e, --export-json   Export JSON to an auto-named file\n"
     printf "    --export FILE       Save tree to FILE (strips colors for text)\n"
     printf "    --no-memory         Hide memory usage\n"
     printf "    --no-state          Hide process state indicators\n"
     printf "    -h, --help          Show this help\n"
-    printf "    -v, --version       Show version\n\n"
+
 
     printf "%bSTATE CODES:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    %b[R]%b Running    %b[S]%b Sleeping    %b[D]%b Disk Sleep\n" "$S9_GREEN" "$S9_NC" "$S9_CYAN" "$S9_NC" "$S9_YELLOW" "$S9_NC"
@@ -372,7 +382,7 @@ main() {
             -p|--pid)
                 [[ $# -ge 2 ]] || s9_die "--pid requires a PID"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "PID must be a number"
-                ROOT_PID="$2"
+                ROOT_PID=$((10#$2))
                 shift 2
                 ;;
             -u|--user)
@@ -383,7 +393,7 @@ main() {
             -d|--depth)
                 [[ $# -ge 2 ]] || s9_die "--depth requires a value"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Depth must be a number"
-                MAX_DEPTH="$2"
+                MAX_DEPTH=$((10#$2))
                 shift 2
                 ;;
             -t|--threads)
@@ -391,6 +401,11 @@ main() {
                 shift
                 ;;
             -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
                 JSON_MODE=true
                 shift
                 ;;
@@ -410,21 +425,25 @@ main() {
             -h|--help)
                 usage
                 ;;
-            -v|--version)
-                echo "s9-tree version $S9_VERSION"
-                exit 0
-                ;;
             *)
                 s9_die "Unknown option: $1. Use --help for usage."
                 ;;
         esac
     done
 
-    # Run environment checks after handling cheap flags like --help/--version.
+    if $AUTO_EXPORT_JSON && [[ -n "$EXPORT_FILE" ]]; then
+        s9_die "-e cannot be combined with --export"
+    fi
+
+    # Run environment checks after handling cheap flags like --help.
     s9_init
 
     if $JSON_MODE && [[ -n "$FILTER_USER" ]]; then
         s9_die "--user cannot be combined with --json yet; use text output or filter JSON with jq"
+    fi
+
+    if $AUTO_EXPORT_JSON; then
+        EXPORT_FILE=$(s9_auto_export_path "tree")
     fi
 
     if ! $JSON_MODE; then
@@ -440,7 +459,7 @@ main() {
         local capture_file
         capture_file=$(mktemp) || s9_die "Cannot create temp file"
 
-        {
+        if ! {
             if [[ -n "${PROC_NAME[$ROOT_PID]:-}" ]]; then
                 if $JSON_MODE; then
                     print_json_tree "$ROOT_PID" 0
@@ -452,18 +471,29 @@ main() {
                 echo "Process $ROOT_PID not found" >&2
                 exit 1
             fi
-        } | tee "$capture_file"
+        } | tee "$capture_file"; then
+            rm -f "$capture_file"
+            s9_die "Failed to generate process tree"
+        fi
 
         # Process export file
         if $JSON_MODE; then
-            cp "$capture_file" "$EXPORT_FILE"
+            cp "$capture_file" "$EXPORT_FILE" || {
+                rm -f "$capture_file"
+                s9_die "Cannot write export file: $EXPORT_FILE"
+            }
         else
             # Strip ANSI codes for text report
-            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE"
+            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE" || {
+                rm -f "$capture_file"
+                s9_die "Cannot write export file: $EXPORT_FILE"
+            }
         fi
 
         rm -f "$capture_file"
-        if $JSON_MODE; then
+        if $AUTO_EXPORT_JSON; then
+            s9_info "JSON exported to $EXPORT_FILE" >&2
+        elif $JSON_MODE; then
             s9_info "Tree saved to $EXPORT_FILE" >&2
         else
             s9_info "Tree saved to $EXPORT_FILE"

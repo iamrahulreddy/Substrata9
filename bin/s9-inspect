@@ -21,6 +21,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/s9-common.sh
 source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
@@ -28,11 +29,11 @@ source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 # Configuration
 #------------------------------------------------------------------------------
 SHOW_MEMORY_DETAILS=false
-SHOW_ENV=false
 QUIET_MODE=false
 JSON_MODE=false
 PROC_BASE="/proc"
 EXPORT_FILE=""
+AUTO_EXPORT_JSON=false
 
 #------------------------------------------------------------------------------
 # Inspection Functions
@@ -53,7 +54,7 @@ inspect_basic() {
 
     # Parse all fields from single read
     local name state ppid uid threads
-    name=$(s9_sanitize_display "$(echo "$status_content" | grep "^Name:" | awk '{print $2}')")
+    name=$(s9_sanitize_display "$(echo "$status_content" | grep "^Name:" | cut -f2-)")
     state=$(echo "$status_content" | grep "^State:" | awk '{print $2, $3}')
     ppid=$(echo "$status_content" | grep "^PPid:" | awk '{print $2}')
     uid=$(echo "$status_content" | grep "^Uid:" | awk '{print $2}')
@@ -80,21 +81,19 @@ inspect_basic() {
     local start_time_ticks uptime_seconds hz start_seconds start_date
     start_time_ticks=$(s9_get_stat_field "$pid" 22 2>/dev/null || echo "0")
     uptime_seconds=$(awk '{print $1}' /proc/uptime)
-    hz=$(getconf CLK_TCK)
-    start_seconds=$(echo "scale=0; $uptime_seconds - ($start_time_ticks / $hz)" | s9_calc)
-    start_date=$(date -d "@$(($(date +%s) - ${start_seconds%.*}))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    hz=${hz:-100}
+    local uptime_int=${uptime_seconds%.*}
+    start_seconds=$(( uptime_int - (start_time_ticks / hz) ))
+    start_date=$(date -d "@$(($(date +%s) - start_seconds))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
 
     # Process age
     local age_str
-    age_str=$(s9_human_duration "${start_seconds%.*}")
+    age_str=$(s9_human_duration "$start_seconds")
 
     # Parent name
     local parent_name
     parent_name=$(s9_get_comm "$ppid")
-
-    # Namespace/Container check
-    local ns_info
-    ns_info=$(s9_check_namespace "$pid")
 
     # State color
     local state_color="$S9_NC"
@@ -113,10 +112,6 @@ inspect_basic() {
     s9_kv "User" "$username (UID $uid)"
     s9_kv "Threads" "$threads"
     s9_kv "Started" "$start_date ($age_str ago)"
-
-    if [[ -n "$ns_info" ]]; then
-        s9_kv "Container" "[$ns_info]" 15 "$S9_MAGENTA"
-    fi
 
     s9_kv "Executable" "$exe"
     s9_kv "Working Dir" "$cwd"
@@ -166,7 +161,14 @@ inspect_memory() {
     # Calculate percentages
     local total_mem mem_percent
     total_mem=$(s9_get_total_mem)
-    mem_percent=$(echo "scale=2; ($vmrss * 100) / $total_mem" | s9_calc)
+    total_mem=${total_mem:-0}
+    if (( total_mem > 0 )); then
+        local mem_int=$(( (vmrss * 100) / total_mem ))
+        local mem_dec=$(( ((vmrss * 10000) / total_mem) % 100 ))
+        mem_percent=$(printf "%d.%02d" "$mem_int" "$mem_dec")
+    else
+        mem_percent="0.00"
+    fi
 
     # Memory color based on usage
     local mem_color="$S9_GREEN"
@@ -234,42 +236,55 @@ inspect_file_descriptors() {
 
     printf "  ${S9_BOLD}Open FDs:${S9_NC} %d\n\n" "$fd_count"
 
-    # Categorize file descriptors
+    # Categorize all file descriptors before displaying the truncated table.
     local files=0 sockets=0 pipes=0 devices=0 other=0
+    local fd_path target fd_type
+
+    local restore_nullglob=false
+    if ! shopt -q nullglob; then
+        restore_nullglob=true
+        shopt -s nullglob
+    fi
+
+    for fd_path in "$fd_dir"/*; do
+        [[ -e "$fd_path" ]] || continue
+        target=$(readlink "$fd_path" 2>/dev/null || echo "(unreadable)")
+        fd_type=$(s9_fd_type "$target")
+
+        case "$fd_type" in
+            file) ((files++)) ;;
+            socket) ((sockets++)) ;;
+            pipe) ((pipes++)) ;;
+            device) ((devices++)) ;;
+            *) ((other++)) ;;
+        esac
+    done
+
+    $restore_nullglob && shopt -u nullglob
 
     printf "  %bFD   Type      Target%b\n" "${S9_DIM}" "${S9_NC}"
     printf "  %b───  ────────  ──────────────────────────────────────────%b\n" "${S9_DIM}" "${S9_NC}"
 
     for fd in $(ls -- "$fd_dir" 2>/dev/null | sort -n | head -30); do
-        local target
         target=$(readlink "$fd_dir/$fd" 2>/dev/null || echo "(unreadable)")
 
-        local fd_type color
-        case "$target" in
-            socket:*)
-                fd_type="socket"
+        local color
+        fd_type=$(s9_fd_type "$target")
+        case "$fd_type" in
+            socket)
                 color="$S9_CYAN"
-                ((sockets++))
                 ;;
-            pipe:*)
-                fd_type="pipe"
+            pipe)
                 color="$S9_YELLOW"
-                ((pipes++))
                 ;;
-            /dev/*)
-                fd_type="device"
+            device)
                 color="$S9_BLUE"
-                ((devices++))
                 ;;
-            anon_inode:*)
-                fd_type="anon"
+            anon)
                 color="$S9_DIM"
-                ((other++))
                 ;;
             *)
-                fd_type="file"
                 color="$S9_GREEN"
-                ((files++))
                 ;;
         esac
 
@@ -325,14 +340,17 @@ inspect_limits() {
     printf "  %bLimit                     Soft Limit           Hard Limit%b\n" "${S9_DIM}" "${S9_NC}"
     printf "  ${S9_DIM}────────────────────────  ───────────────────  ───────────────────${S9_NC}\n"
 
-    grep -E "^(Max open files|Max processes|Max stack size|Max resident set|Max address space)" "$proc_dir/limits" | \
-    while read -r line; do
-        local name soft hard
-        name=$(echo "$line" | sed 's/  */ /g' | cut -d' ' -f1-3)
-        soft=$(echo "$line" | awk '{print $(NF-2)}')
-        hard=$(echo "$line" | awk '{print $(NF-1)}')
-        printf "  %-24s  %-19s  %-19s\n" "$name" "$soft" "$hard"
-    done
+    awk '
+        /^Max processes[[:space:]]/ {
+            name = $1 " " $2
+            printf "  %-24s  %-19s  %-19s\n", name, $(NF-2), $(NF-1)
+            next
+        }
+        /^(Max open files|Max stack size|Max resident set|Max address space)[[:space:]]/ {
+            name = $1 " " $2 " " $3
+            printf "  %-24s  %-19s  %-19s\n", name, $(NF-2), $(NF-1)
+        }
+    ' "$proc_dir/limits"
 }
 
 inspect_io() {
@@ -374,33 +392,19 @@ inspect_io() {
     printf "  ${S9_BOLD}%-20s${S9_NC} %s read, %s write\n" "Syscalls:" "$syscr" "$syscw"
 }
 
-inspect_environment() {
+inspect_gpu() {
     local pid=$1
-    local proc_dir="$PROC_BASE/$pid"
+    local gpu_row
 
-    s9_header "ENVIRONMENT VARIABLES"
+    gpu_row=$(s9_gpu_process_for_pid "$pid" 2>/dev/null) || return 0
 
-    if [[ ! -r "$proc_dir/environ" ]]; then
-        printf "  %b(Permission denied)%b\n" "${S9_YELLOW}" "${S9_NC}"
-        return
-    fi
+    local gpu_index gpu_name gpu_memory gpu_type
+    IFS='|' read -r _ _ gpu_index gpu_name gpu_memory gpu_type <<< "$gpu_row"
 
-    local env_count
-    env_count=$(tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null | wc -l)
-
-    printf "  %bShowing first 15 of %d variables:%b\n" "${S9_DIM}" "$env_count" "${S9_NC}"
-    echo ""
-
-    tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null | head -15 | while read -r line; do
-        local key="${line%%=*}"
-        local value="${line#*=}"
-        printf "  ${S9_BOLD}%s${S9_NC}=%b\n" "$key" "${value:0:60}${value:60:+...}"
-    done
-
-    if (( env_count > 15 )); then
-        echo ""
-        printf "  %b... and %d more%b\n" "${S9_DIM}" "$((env_count - 15))" "${S9_NC}"
-    fi
+    s9_header "GPU"
+    s9_kv "GPU" "${gpu_name:-unknown} (${gpu_index:-unknown})"
+    s9_kv "GPU Memory" "${gpu_memory:-0} MB"
+    s9_kv "GPU Type" "${gpu_type:-compute}"
 }
 
 inspect_json() {
@@ -414,7 +418,7 @@ inspect_json() {
     status_content=$(cat "$proc_dir/status" 2>/dev/null) || { echo "  \"error\": \"Cannot read process status\""; echo "}"; return; }
 
     local name state ppid uid threads
-    name=$(echo "$status_content" | grep "^Name:" | awk '{print $2}')
+    name=$(s9_sanitize_display "$(echo "$status_content" | grep "^Name:" | awk '{print $2}')")
     state=$(echo "$status_content" | grep "^State:" | awk '{print $2}')
     ppid=$(echo "$status_content" | grep "^PPid:" | awk '{print $2}')
     uid=$(echo "$status_content" | grep "^Uid:" | awk '{print $2}')
@@ -427,8 +431,6 @@ inspect_json() {
     cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
     local cwd
     cwd=$(readlink "$proc_dir/cwd" 2>/dev/null || echo "")
-    local ns_info
-    ns_info=$(s9_check_namespace "$pid")
 
     s9_json_kv "pid" "$pid"
     s9_json_kv "name" "$name"
@@ -440,7 +442,6 @@ inspect_json() {
     s9_json_kv "exe" "$exe"
     s9_json_kv "cwd" "$cwd"
     s9_json_kv "cmdline" "$cmdline"
-    s9_json_kv "container" "$ns_info"
 
     # Memory
     local vmsize vmrss
@@ -465,10 +466,49 @@ inspect_json() {
         rchar=$(echo "$io_content" | grep "^rchar:" | awk '{print $2}')
         wchar=$(echo "$io_content" | grep "^wchar:" | awk '{print $2}')
         s9_json_kv "io_read_chars" "${rchar:-0}"
-        s9_json_kv "io_write_chars" "${wchar:-0}" "last"
+        s9_json_kv "io_write_chars" "${wchar:-0}"
     else
         s9_json_kv "io_read_chars" "0"
-        s9_json_kv "io_write_chars" "0" "last"
+        s9_json_kv "io_write_chars" "0"
+    fi
+
+    # GPU
+    local gpu_row
+    if gpu_row=$(s9_gpu_process_for_pid "$pid" 2>/dev/null); then
+        local gpu_pid gpu_process_name gpu_index gpu_name gpu_memory gpu_type gpu_scope gpu_used_total
+        IFS='|' read -r gpu_pid gpu_process_name gpu_index gpu_name gpu_memory gpu_type <<< "$gpu_row"
+        gpu_scope=$(s9_gpu_pid_scope "$gpu_pid" "$gpu_process_name")
+        gpu_used_total=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+        s9_json_kv "gpu_available" "true"
+        s9_json_kv "gpu_pid" "$gpu_pid"
+        s9_json_kv "gpu_process_name" "$gpu_process_name"
+        s9_json_kv "gpu_index" "$gpu_index"
+        s9_json_kv "gpu_name" "$gpu_name"
+        s9_json_kv "gpu_memory_mb" "${gpu_memory:-0}"
+        s9_json_kv "gpu_pid_scope" "$gpu_scope"
+        s9_json_kv "gpu_memory_used_mb" "$gpu_used_total"
+        s9_json_kv "gpu_process_type" "${gpu_type:-compute}" "last"
+    else
+        local gpu_used_total=0
+        if s9_gpu_available; then
+            gpu_used_total=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+            s9_json_kv "gpu_available" "true"
+        else
+            s9_json_kv "gpu_available" "false"
+        fi
+        s9_json_kv "gpu_pid" "null"
+        s9_json_kv "gpu_process_name" ""
+        s9_json_kv "gpu_index" ""
+        s9_json_kv "gpu_name" ""
+        s9_json_kv "gpu_memory_mb" "0"
+        s9_json_kv "gpu_pid_scope" ""
+        s9_json_kv "gpu_process_type" ""
+        if (( gpu_used_total > 100 )); then
+            s9_json_kv "gpu_memory_used_mb" "$gpu_used_total"
+            s9_json_kv "gpu_note" "GPU memory is in use, but nvidia-smi did not map it to this local PID; container PID isolation may be hiding the owner" "last"
+        else
+            s9_json_kv "gpu_memory_used_mb" "$gpu_used_total" "last"
+        fi
     fi
 
     echo "}"
@@ -487,12 +527,12 @@ usage() {
 
     printf "%bOPTIONS:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    -f, --full      Include detailed memory map\n"
-    printf "    -e, --env       Show environment variables\n"
     printf "    -j, --json      Output in JSON format\n"
+    printf "    -e, --export-json  Export JSON to an auto-named file\n"
     printf "    --export FILE   Save report to FILE (strips colors for text)\n"
     printf "    -q, --quiet     Minimal output (for scripting)\n"
     printf "    -h, --help      Show this help\n"
-    printf "    -v, --version   Show version\n\n"
+
 
     printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    s9-inspect 1234           # Inspect by PID\n"
@@ -529,7 +569,12 @@ run_inspection() {
         fd_count=$(s9_get_fd_count "$pid")
         state=$(s9_get_state "$pid")
         threads=$(s9_get_threads "$pid")
-        echo "PID=$pid RSS=${rss}kB FDs=$fd_count STATE=$state THREADS=$threads"
+        local gpu_mem=0
+        local gpu_row
+        if gpu_row=$(s9_gpu_process_for_pid "$pid" 2>/dev/null); then
+            IFS='|' read -r _ _ _ _ gpu_mem _ <<< "$gpu_row"
+        fi
+        echo "PID=$pid RSS=${rss}kB FDs=$fd_count STATE=$state THREADS=$threads GPU_MEM=${gpu_mem:-0}MB"
         return 0
     fi
 
@@ -544,10 +589,7 @@ run_inspection() {
     inspect_signals "$pid"
     inspect_limits "$pid"
     inspect_io "$pid"
-
-    if $SHOW_ENV; then
-        inspect_environment "$pid"
-    fi
+    inspect_gpu "$pid"
 
     echo ""
     s9_rule
@@ -570,11 +612,12 @@ main() {
                 SHOW_MEMORY_DETAILS=true
                 shift
                 ;;
-            -e|--env)
-                SHOW_ENV=true
+            -j|--json)
+                JSON_MODE=true
                 shift
                 ;;
-            -j|--json)
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
                 JSON_MODE=true
                 shift
                 ;;
@@ -590,14 +633,12 @@ main() {
             -h|--help)
                 usage
                 ;;
-            -v|--version)
-                echo "s9-inspect version $S9_VERSION"
-                exit 0
-                ;;
+
             -*)
                 s9_die "Unknown option: $1. Use --help for usage."
                 ;;
             *)
+                [[ -z "$target" ]] || s9_die "Too many targets. Expected one PID or process name."
                 target="$1"
                 shift
                 ;;
@@ -605,8 +646,14 @@ main() {
     done
 
     [[ -z "$target" ]] && usage
+    if $AUTO_EXPORT_JSON && [[ -n "$EXPORT_FILE" ]]; then
+        s9_die "-e cannot be combined with --export"
+    fi
+    if $AUTO_EXPORT_JSON && $QUIET_MODE; then
+        s9_die "-e cannot be combined with --quiet"
+    fi
 
-    # Run environment checks after handling cheap flags like --help/--version.
+    # Run environment checks after handling cheap flags like --help.
     s9_init
 
     # Resolve PID
@@ -614,23 +661,38 @@ main() {
     pid=$(s9_resolve_pid "$target") || exit 1
 
     # Handle Export
+    if $AUTO_EXPORT_JSON; then
+        EXPORT_FILE=$(s9_auto_export_path "inspect")
+    fi
+
     if [[ -n "$EXPORT_FILE" ]]; then
         local capture_file
         capture_file=$(mktemp) || s9_die "Cannot create temp file"
 
         # Run inspection and capture output
-        run_inspection "$pid" | tee "$capture_file"
+        if ! run_inspection "$pid" | tee "$capture_file"; then
+            rm -f "$capture_file"
+            s9_die "Failed to generate inspection report"
+        fi
 
         # Process export file
         if $JSON_MODE; then
-            cp "$capture_file" "$EXPORT_FILE"
+            cp "$capture_file" "$EXPORT_FILE" || {
+                rm -f "$capture_file"
+                s9_die "Cannot write export file: $EXPORT_FILE"
+            }
         else
             # Strip ANSI codes for text report
-            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE"
+            sed "s/$(printf '\033')\[[0-9;]*[a-zA-Z]//g" "$capture_file" | tr -d '\000-\011\013-\037' > "$EXPORT_FILE" || {
+                rm -f "$capture_file"
+                s9_die "Cannot write export file: $EXPORT_FILE"
+            }
         fi
 
         rm -f "$capture_file"
-        if $JSON_MODE; then
+        if $AUTO_EXPORT_JSON; then
+            s9_info "JSON exported to $EXPORT_FILE" >&2
+        elif $JSON_MODE; then
             s9_info "Report saved to $EXPORT_FILE" >&2
         else
             s9_info "Report saved to $EXPORT_FILE"

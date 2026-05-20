@@ -8,12 +8,56 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Planned
-- **Styling & linting:** Apply ShellCheck-driven style and robustness
-	fixes in a future maintenance commit (traps quoting, safe `printf`
-	formats, avoid parsing `ls`, and other non-functional improvements).
-- **GPU process visibility:** Add GPU-aware process diagnostics using
-	`nvidia-smi` where available, with room for other vendor backends later.
+No pending changes.
+
+---
+
+## [1.3.1] - 2026-05-20
+
+### Added
+- Container-aware memory resolution using cgroup v1 (`memory.limit_in_bytes`) and v2 (`memory.max`) to report accurate available RAM inside containers instead of leaking host-level `/proc/meminfo` values.
+- GPU PID-namespace detection: `s9-gpu`, `s9-inspect`, and `s9-anomaly` now identify when `nvidia-smi` reports a container proxy PID (such as `dumb-init` at PID 1) and tag the result with `pid_scope: container_proxy` and a descriptive note field.
+- Aggregate GPU memory field (`gpu_memory_used_mb`) in GPU-aware JSON output for reliable GPU telemetry even when per-process PID attribution is unavailable.
+- Cross-platform validation across Tesla T4 (Colab), A100 40 GB (Lightning AI), and H100 80 GB (Modal Firecracker) with 18/18 stages and 0 red flags on each run.
+
+### Changed
+- Cloud/GPU validation treats `jq`, `shellcheck`, `bc`, `zip`, and `nvidia-smi` as optional unless explicitly required by the runner environment.
+- Heavy GPU stress allocation is now adaptive and chunked, with configurable caps (`S9_HEAVY_GPU_FRACTION`, `S9_HEAVY_GPU_MAX_MB`, `S9_HEAVY_GPU_MIN_MB`), replacing the previous single-tensor approach.
+- Load-induced latency slowdown is now a warning by default; strict failure gating requires `S9_FAIL_ON_PERF_SLOWDOWN=1`.
+- Static audit scans expanded to include extensionless shell entrypoints in `bin/` and example scripts.
+- Test suites now report skipped checks separately from passed checks, with `S9_FAIL_ON_SKIP=1` available for strict release gating.
+
+### Fixed
+- Removed stale packaging-helper references from release notes and ignore comments so the source tree reflects the current shipped files.
+- Removed hardcoded `/tmp` paths from example scripts; all temp output now respects `TMPDIR`.
+- Removed spurious `bc` dependency from example scripts.
+
+---
+
+## [1.3.0] - 2026-05-19
+
+### Added
+- **`s9-gpu` tool** — Optional NVIDIA GPU process visibility using `nvidia-smi` to map GPU memory to specific Linux processes.
+- **Auto JSON Export** — Added `-e` / `--export-json` flag to all tools, saving output to an auto-generated timestamped file with the local timezone suffix (e.g. `s9-inspect_2026-05-16_19-30-00_UTC.json`).
+- **Comprehensive test gating** — Introduced cloud-oriented test coverage with dependency checking, bash syntax checking, ShellCheck, JSON validation, resource leak detection, concurrency stress, and heavy workload testing under GPU load.
+- **Controlled stress testing** — Added real PyTorch CUDA workloads and a deterministic Bash loop creating 80+ file descriptors to validate parsing under pressure.
+
+### Changed
+- **Performance polish** — Eliminated hundreds of subshell forks to `bc` and `awk` by implementing native Bash integer math `(( ... ))` for percentage logic, drastically speeding up all tools on busy servers.
+- **CLI Hygiene** — Removed confusing `-v`/`--version` flags from all tools to avoid ambiguity with external driver versions (version string remains visible in `--help`).
+- **Signal decoding clarity** — Documented the intentional truncation of 64-bit masks from `/proc/` to 32 bits to parse standard POSIX signals.
+- **JSON regex generation** — Tightened number formatting in `s9_json_kv` so values with leading zeros (e.g. PID `007`) are correctly emitted as JSON strings, avoiding invalid types.
+- **Test robustness** — Massively expanded the test suite from ~60 to 462 assertions covering GPU mocking, snapshot uniqueness, leading zeros, and strict JSON schema validation.
+
+### Fixed
+- **Orphan miscalculation** — Fixed `s9-anomaly --quiet` mode, applying the correct system-daemon filter and kernel thread exclusion to prevent inflated orphan counts.
+- **Trap clobbering** — Replaced brittle inline traps with reliable `cleanup()` functions in `s9-fdmap` and `s9-compare` to prevent overwritten `EXIT` handlers.
+- **Math Fallback** — Patched the bundled `bin/bc` to correctly parse multi-character operators (`==`, `<=`, `!=`) under Bash 5.1+, preventing random script failures.
+- **Division by zero** — Added safeguards to memory percentage logic across the codebase to handle unreadable `/proc/meminfo` gracefully.
+- **JSON commas** — Corrected the index tracking in `s9-anomaly` to emit valid JSON without trailing commas during selective flag execution.
+- **Multiple positional arguments** — Fixed `s9-inspect` to explicitly reject multiple PIDs/names, preventing hidden errors.
+- **Container parsing** — Removed experimental namespace detection from `s9-inspect` and `s9-tree` that caused hangs and inaccurate JSON.
+- **Security hardening** — Removed `--env` flag from `s9-inspect` to prevent sensitive environment variable exposure.
 
 ---
 
@@ -119,6 +163,9 @@ Initial public release.
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| Unreleased | — | Pending changes |
+| 1.3.1 | 2026-05-20 | Container-aware memory/GPU, cross-platform validation (T4/A100/H100), adaptive stress |
+| 1.3.0 | 2026-05-19 | Performance polish, GPU visibility, Auto JSON export, Subshell elimination |
 | 1.2.1 | 2026-05-10 | JSON validity, CLI guards, safer snapshots, test wiring |
 | 1.2.0 | 2026-01-02 | Bug fixes, improved container detection, documentation |
 | 1.1.0 | 2025-12-05 | Process comparison, test improvements |

@@ -46,12 +46,22 @@ Returns detailed information about a single process.
   "exe": "/usr/sbin/nginx",
   "cwd": "/var/www/html",
   "cmdline": "nginx: worker process",
-  "container": "docker",
+
   "vm_size_kb": 10240,
   "rss_kb": 5120,
   "fd_count": 12,
   "io_read_chars": 1000,
-  "io_write_chars": 2000
+  "io_write_chars": 2000,
+
+  "gpu_available": false,
+  "gpu_pid": null,
+  "gpu_process_name": "",
+  "gpu_index": "",
+  "gpu_name": "",
+  "gpu_memory_mb": 0,
+  "gpu_pid_scope": "",
+  "gpu_process_type": "",
+  "gpu_memory_used_mb": 0
 }
 ```
 
@@ -70,12 +80,23 @@ Returns detailed information about a single process.
 | `exe` | string | Path to executable |
 | `cwd` | string | Current working directory |
 | `cmdline` | string | Full command line |
-| `container` | string | Container type if detected ("docker", "k8s", "lxc", or empty) |
+
 | `vm_size_kb` | number | Virtual memory size in kilobytes |
 | `rss_kb` | number | Resident set size (physical memory) in kilobytes |
 | `fd_count` | number | Number of open file descriptors |
 | `io_read_chars` | number | Characters read from `/proc/[pid]/io` (requires permission) |
 | `io_write_chars` | number | Characters written from `/proc/[pid]/io` (requires permission) |
+
+| `gpu_available` | boolean | Whether nvidia-smi is present and functional |
+| `gpu_pid` | number/null | PID as reported by nvidia-smi, or null if the inspected process is not directly mapped |
+| `gpu_process_name` | string | Process name reported by nvidia-smi |
+| `gpu_index` | number/string | GPU index (empty string if not using GPU) |
+| `gpu_name` | string | GPU model name |
+| `gpu_memory_mb` | number | GPU memory allocated in MB |
+| `gpu_pid_scope` | string | PID attribution status: `visible`, `host`, `container_proxy`, `name_mismatch`, `unknown`, or empty |
+| `gpu_process_type` | string | GPU process type (e.g. "compute") |
+| `gpu_memory_used_mb` | number | Total GPU memory currently reported by nvidia-smi across visible GPUs |
+| `gpu_note` | string | Optional note when GPU memory exists but exact local PID attribution is unavailable |
 
 
 ### Example Queries
@@ -84,8 +105,7 @@ Returns detailed information about a single process.
 # Get memory usage in MB
 s9-inspect nginx --json | jq '.rss_kb / 1024'
 
-# Check if process is in a container
-s9-inspect 1234 --json | jq 'if .container != "" then "containerized" else "host" end'
+
 
 # Get all fields as key=value pairs
 s9-inspect 1234 --json | jq -r 'to_entries | .[] | "\(.key)=\(.value)"'
@@ -109,7 +129,7 @@ Returns a recursive tree structure representing the process hierarchy.
   "rss_kb": 12345,
   "user": "root",
   "threads": 1,
-  "container": "",
+
   "children": [
     {
       "pid": 100,
@@ -118,7 +138,7 @@ Returns a recursive tree structure representing the process hierarchy.
       "rss_kb": 5678,
       "user": "root",
       "threads": 1,
-      "container": "",
+
       "children": []
     },
     {
@@ -159,7 +179,7 @@ Returns a recursive tree structure representing the process hierarchy.
 | `rss_kb` | number | Resident memory in kilobytes |
 | `user` | string | Process owner |
 | `threads` | number | Number of threads |
-| `container` | string | Container or namespace marker if detected, otherwise empty |
+
 | `children` | array | Array of child process objects (recursive) |
 
 
@@ -296,7 +316,22 @@ Returns arrays of detected anomalies, organized by type.
       "user": "www-data",
       "command": "/usr/bin/orphan_worker"
     }
-  ]
+  ],
+  "gpu": [
+    {
+      "pid": 1,
+      "name": "/bin/dumb-init",
+      "gpu_index": 0,
+      "gpu_name": "NVIDIA H100 80GB HBM3",
+      "gpu_memory_mb": 4096,
+      "pid_scope": "container_proxy",
+      "gpu_process_type": "compute"
+    }
+  ],
+  "gpu_available": true,
+  "gpu_memory_used_mb": 4096,
+  "gpu_attribution": "container_proxy",
+  "gpu_note": "nvidia-smi reports GPU memory against a container-visible proxy PID; local workload PID mapping may be unavailable"
 }
 ```
 
@@ -342,6 +377,27 @@ Returns arrays of detected anomalies, organized by type.
 | `ppid` | number | Current parent PID, usually 1 for adopted processes |
 | `user` | string | Process owner |
 | `command` | string | Command line, when available |
+
+**gpu array:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pid` | number | Process ID |
+| `name` | string | Process name |
+| `gpu_index` | number | Physical GPU index |
+| `gpu_name` | string | GPU model name |
+| `gpu_memory_mb` | number | GPU memory allocated in MB |
+| `pid_scope` | string | Local PID attribution status: `visible`, `host`, `container_proxy`, `name_mismatch`, or `unknown` |
+| `gpu_process_type` | string | GPU process type (e.g. "compute") |
+
+**GPU top-level fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gpu_available` | boolean | Whether `nvidia-smi` is installed and returning data |
+| `gpu_memory_used_mb` | number | Total GPU memory currently reported by nvidia-smi across visible GPUs |
+| `gpu_attribution` | string | Optional attribution mode, currently `container_proxy` when nvidia-smi reports memory against PID 1 or an init wrapper |
+| `gpu_note` | string | Optional explanation when exact per-process mapping is unavailable |
 
 
 ### Example Queries
@@ -436,13 +492,13 @@ Returns status information for capture operations and comparison results for dif
 
 ```bash
 # Check if memory grew significantly
-s9-snapshot diff baseline after_load --json | jq '.assessment.memory_status'
+s9-snapshot diff baseline after_load --latest --json | jq '.assessment.memory_status'
 
 # Get memory growth in MB
-s9-snapshot diff baseline after_load --json | jq '.memory.rss_diff_kb / 1024'
+s9-snapshot diff baseline after_load --latest --json | jq '.memory.rss_diff_kb / 1024'
 
 # Alert if memory status is critical
-s9-snapshot diff baseline after_load --json | jq 'if .assessment.memory_status == "critical_growth" then "ALERT!" else "OK" end'
+s9-snapshot diff baseline after_load --latest --json | jq 'if .assessment.memory_status == "critical_growth" then "ALERT!" else "OK" end'
 ```
 
 ## s9-compare
@@ -452,6 +508,53 @@ s9-snapshot diff baseline after_load --json | jq 'if .assessment.memory_status =
 ```bash
 s9-compare 1234 5678 --json | jq '.resources'
 ```
+
+## s9-gpu
+
+Returns process and NVIDIA GPU memory mapping.
+
+**When to use:** Creating metrics for GPU utilization per process or auditing workloads.
+
+### Schema
+
+```json
+{
+  "gpu_available": true,
+  "count": 1,
+  "processes": [
+    {
+      "pid": 5678,
+      "name": "python3",
+      "gpu_index": 0,
+      "gpu_name": "Tesla T4",
+      "gpu_memory_mb": 4096,
+      "pid_scope": "visible",
+      "gpu_process_type": "compute"
+    }
+  ],
+  "gpu_memory_used_mb": 4096
+}
+```
+
+### Field Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gpu_available` | boolean | True if nvidia-smi is installed and returning data |
+| `count` | number | Total number of GPU processes returned |
+| `processes` | array | Array of process objects |
+| `pid` | number | Process ID (inside processes array) |
+| `name` | string | Process name (inside processes array) |
+| `gpu_index` | number | Physical GPU index (inside processes array) |
+| `gpu_name` | string | GPU model name (inside processes array) |
+| `gpu_memory_mb` | number | GPU memory allocated in MB (inside processes array) |
+| `pid_scope` | string | Local PID attribution status: `visible`, `host`, `container_proxy`, `name_mismatch`, or `unknown` |
+| `gpu_process_type` | string | GPU process type, e.g. "compute" or "graphics" (inside processes array) |
+| `gpu_memory_used_mb` | number | Total GPU memory currently reported by nvidia-smi across visible GPUs |
+| `attribution` | string | Optional top-level attribution mode, currently `container_proxy` when nvidia-smi reports memory against PID 1 or an init wrapper |
+| `note` | string | Optional explanation when exact per-process mapping is unavailable |
+
+In containers, `nvidia-smi` can report GPU memory against a host PID or a container-visible proxy such as PID 1. In that case `gpu_memory_used_mb` is the safer aggregate signal, while per-process rows should be treated as best-effort attribution.
 
 ## Tips for Working with JSON Output
 

@@ -19,6 +19,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/s9-common.sh
 source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
 
@@ -32,6 +33,17 @@ LEAK_THRESHOLD=100
 TOP_N=20
 QUIET_MODE=false
 JSON_MODE=false
+AUTO_EXPORT_JSON=false
+
+declare -A SOCKET_INDEX=()
+declare -A SOCKET_MATCHES=()
+SOCKET_FOUND=0
+SOCKET_FIRST=true
+S9_FDMAP_TMP_FILE=""
+
+_s9_fdmap_cleanup() {
+    [[ -n "${S9_FDMAP_TMP_FILE:-}" ]] && rm -f -- "$S9_FDMAP_TMP_FILE"
+}
 
 #------------------------------------------------------------------------------
 # FD Analysis Functions
@@ -51,7 +63,9 @@ system_summary() {
     # Use temp file for streaming sort (handles large process counts)
     local tmp_file
     tmp_file=$(mktemp) || s9_die "Cannot create temp file"
-    trap "rm -f '$tmp_file'" EXIT
+
+    S9_FDMAP_TMP_FILE="$tmp_file"
+    trap _s9_fdmap_cleanup EXIT
 
     local total_fds=0
     local total_procs=0
@@ -87,6 +101,11 @@ system_summary() {
     # Sort by FD count descending and show top N
     local count=0
     local first=true
+
+    # Guard: verify temp file has data before sorting to avoid silent empty output
+    if [[ ! -s "$tmp_file" ]]; then
+        s9_debug "No process data collected for FD summary"
+    fi
 
     # Read sorted output
     while IFS='|' read -r fd_count pid name user; do
@@ -127,7 +146,7 @@ system_summary() {
         if [[ -r /proc/sys/fs/file-nr ]]; then
             local file_nr
             file_nr=$(cat /proc/sys/fs/file-nr)
-            local allocated used max
+            local allocated max
             allocated=$(echo "$file_nr" | awk '{print $1}')
             max=$(echo "$file_nr" | awk '{print $3}')
             s9_json_kv "system_allocated" "$allocated"
@@ -150,11 +169,17 @@ system_summary() {
         if [[ -r /proc/sys/fs/file-nr ]]; then
             local file_nr
             file_nr=$(cat /proc/sys/fs/file-nr)
-            local allocated used max
+            local allocated max
             allocated=$(echo "$file_nr" | awk '{print $1}')
             max=$(echo "$file_nr" | awk '{print $3}')
             local percent
-            percent=$(echo "scale=1; ($allocated * 100) / $max" | s9_calc)
+            if (( max > 0 )); then
+                local int_val=$(( (allocated * 100) / max ))
+                local dec_val=$(( ((allocated * 1000) / max) % 10 ))
+                percent="${int_val}.${dec_val}"
+            else
+                percent="0.0"
+            fi
             printf "%bSystem:%b %s / %s FDs allocated (%s%%)\n" "${S9_BOLD}" "${S9_NC}" "$allocated" "$max" "$percent"
         fi
     fi
@@ -162,6 +187,11 @@ system_summary() {
 
 find_file_users() {
     local target_file="$1"
+    local canonical_target="$target_file"
+
+    if command -v realpath >/dev/null 2>&1; then
+        canonical_target=$(realpath -m "$target_file" 2>/dev/null || printf "%s" "$target_file")
+    fi
 
     if $JSON_MODE; then
         echo "{"
@@ -190,7 +220,10 @@ find_file_users() {
             local target
             target=$(readlink "$fd" 2>/dev/null || echo "")
 
-            if [[ "$target" == "$target_file" ]] || [[ "$target" == *"$target_file"* ]]; then
+            if [[ "$target" == "$target_file" ]] ||
+               [[ "$target" == "$target_file (deleted)" ]] ||
+               [[ "$target" == "$canonical_target" ]] ||
+               [[ "$target" == "$canonical_target (deleted)" ]]; then
                 local name
                 name=$(s9_get_comm "$pid")
 
@@ -229,11 +262,110 @@ find_file_users() {
     fi
 }
 
-find_socket_users() {
-    local target_port="$1"
+build_socket_inode_index() {
+    SOCKET_INDEX=()
 
-    # Validate port number
+    local proc_dir pid fd_dir name fd target inode
+    for proc_dir in /proc/[0-9]*; do
+        pid="${proc_dir##*/}"
+        fd_dir="$proc_dir/fd"
+
+        [[ -r "$fd_dir" ]] || continue
+        name=$(s9_get_comm "$pid")
+        name="${name//|/}"
+
+        for fd in "$fd_dir"/*; do
+            [[ -e "$fd" ]] || continue
+            target=$(readlink "$fd" 2>/dev/null || echo "")
+            if [[ "$target" =~ ^socket:\[([0-9]+)\]$ ]]; then
+                inode="${BASH_REMATCH[1]}"
+                SOCKET_INDEX[$inode]="${SOCKET_INDEX[$inode]:-}${pid}|${name}"$'\n'
+            fi
+        done
+    done
+}
+
+emit_socket_match() {
+    local inode="$1"
+    local protocol="$2"
+    local local_addr="$3"
+    local entries="${SOCKET_INDEX[$inode]:-}"
+
+    [[ -n "$entries" ]] || return 0
+
+    local pid name
+    while IFS='|' read -r pid name; do
+        [[ -n "$pid" ]] || continue
+
+        if $JSON_MODE; then
+            if $SOCKET_FIRST; then SOCKET_FIRST=false; else echo ","; fi
+            echo "    {"
+            s9_json_kv "pid" "$pid" "" "    "
+            s9_json_kv "name" "$name" "" "    "
+            s9_json_kv "protocol" "$protocol" "" "    "
+            s9_json_kv "local_addr" "$local_addr" "last" "    "
+            echo -n "    }"
+        else
+            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
+                "$pid" "${name:0:20}" "$protocol" "$local_addr"
+        fi
+
+        ((SOCKET_FOUND++))
+    done <<< "$entries"
+}
+
+scan_socket_table() {
+    local table="$1"
+    local protocol="$2"
+    local port_hex="$3"
+
+    [[ -r "$table" ]] || return 0
+
+    local local_addr inode
+    while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
+        [[ "$local_addr" == *":$port_hex" ]] || continue
+        [[ -n "$inode" ]] || continue
+        SOCKET_MATCHES[$inode]="$protocol|$local_addr"
+    done < <(tail -n +2 "$table" 2>/dev/null)
+}
+
+scan_socket_table_set() {
+    local net_dir="$1"
+    local port_hex="$2"
+
+    scan_socket_table "$net_dir/tcp" TCP "$port_hex"
+    scan_socket_table "$net_dir/tcp6" TCP6 "$port_hex"
+    scan_socket_table "$net_dir/udp" UDP "$port_hex"
+    scan_socket_table "$net_dir/udp6" UDP6 "$port_hex"
+}
+
+scan_socket_namespaces() {
+    local port_hex="$1"
+    local -A seen_netns=()
+
+    scan_socket_table_set /proc/net "$port_hex"
+
+    local current_ns
+    current_ns=$(readlink /proc/self/ns/net 2>/dev/null || echo "")
+    [[ -n "$current_ns" ]] && seen_netns[$current_ns]=1
+
+    local proc_dir ns_key
+    for proc_dir in /proc/[0-9]*; do
+        [[ -d "$proc_dir/net" ]] || continue
+
+        ns_key=$(readlink "$proc_dir/ns/net" 2>/dev/null || echo "$proc_dir")
+        [[ -n "$ns_key" ]] || ns_key="$proc_dir"
+        [[ -n "${seen_netns[$ns_key]:-}" ]] && continue
+
+        seen_netns[$ns_key]=1
+        scan_socket_table_set "$proc_dir/net" "$port_hex"
+    done
+}
+
+find_socket_users_indexed() {
+    local target_port="$1"
     s9_validate_port "$target_port"
+    local target_port_num=$((10#$target_port))
 
     if $JSON_MODE; then
         echo "{"
@@ -242,173 +374,37 @@ find_socket_users() {
     else
         printf "%bProcesses using port %s:%b\n" "${S9_BOLD}" "$target_port" "${S9_NC}"
         echo ""
-
-        # Convert port to hex for /proc/net matching
-        local port_hex
-        port_hex=$(printf "%04X" "$target_port")
-
         printf "  ${S9_BOLD}%-8s %-20s %-10s %s${S9_NC}\n" "PID" "PROCESS" "PROTOCOL" "LOCAL ADDR"
-        printf "  ${S9_DIM}────────────────────────────────────────────────────────────────${S9_NC}\n"
+        printf "  ${S9_DIM}----------------------------------------------------------------${S9_NC}\n"
     fi
 
-    local found=0
-    local first=true
     local port_hex
-    port_hex=$(printf "%04X" "$target_port")
+    port_hex=$(printf "%04X" "$target_port_num")
 
-    # Check TCP connections
-    if [[ -r /proc/net/tcp ]]; then
-        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
-            [[ "$local_addr" == *":$port_hex" ]] || continue
+    SOCKET_FOUND=0
+    SOCKET_FIRST=true
+    SOCKET_MATCHES=()
+    build_socket_inode_index
+    scan_socket_namespaces "$port_hex"
 
-            # Find process with this inode
-            for proc_dir in /proc/[0-9]*; do
-                local pid="${proc_dir##*/}"
-                [[ -r "$proc_dir/fd" ]] || continue
-
-                for fd in "$proc_dir/fd"/*; do
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null || echo "")
-                    if [[ "$target" == "socket:[$inode]" ]]; then
-                        local name
-                        name=$(s9_get_comm "$pid")
-
-                        if $JSON_MODE; then
-                            if $first; then first=false; else echo ","; fi
-                            echo "    {"
-                            s9_json_kv "pid" "$pid" "" "    "
-                            s9_json_kv "name" "$name" "" "    "
-                            s9_json_kv "protocol" "TCP" "" "    "
-                            s9_json_kv "local_addr" "$local_addr" "last" "    "
-                            echo -n "    }"
-                        else
-                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
-                                "$pid" "${name:0:20}" "TCP" "$local_addr"
-                        fi
-                        ((found++))
-                    fi
-                done
-            done
-        done < <(tail -n +2 /proc/net/tcp 2>/dev/null)
-    fi
-
-    # Check TCPv6 connections
-    if [[ -r /proc/net/tcp6 ]]; then
-        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
-            [[ "$local_addr" == *":$port_hex" ]] || continue
-
-            # Find process with this inode
-            for proc_dir in /proc/[0-9]*; do
-                local pid="${proc_dir##*/}"
-                [[ -r "$proc_dir/fd" ]] || continue
-
-                for fd in "$proc_dir/fd"/*; do
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null || echo "")
-                    if [[ "$target" == "socket:[$inode]" ]]; then
-                        local name
-                        name=$(s9_get_comm "$pid")
-
-                        if $JSON_MODE; then
-                            if $first; then first=false; else echo ","; fi
-                            echo "    {"
-                            s9_json_kv "pid" "$pid" "" "    "
-                            s9_json_kv "name" "$name" "" "    "
-                            s9_json_kv "protocol" "TCP6" "" "    "
-                            s9_json_kv "local_addr" "$local_addr" "last" "    "
-                            echo -n "    }"
-                        else
-                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
-                                "$pid" "${name:0:20}" "TCP6" "$local_addr"
-                        fi
-                        ((found++))
-                    fi
-                done
-            done
-        done < <(tail -n +2 /proc/net/tcp6 2>/dev/null)
-    fi
-
-    # Check UDP connections
-    if [[ -r /proc/net/udp ]]; then
-        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
-            [[ "$local_addr" == *":$port_hex" ]] || continue
-
-            for proc_dir in /proc/[0-9]*; do
-                local pid="${proc_dir##*/}"
-                [[ -r "$proc_dir/fd" ]] || continue
-
-                for fd in "$proc_dir/fd"/*; do
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null || echo "")
-                    if [[ "$target" == "socket:[$inode]" ]]; then
-                        local name
-                        name=$(s9_get_comm "$pid")
-
-                        if $JSON_MODE; then
-                            if $first; then first=false; else echo ","; fi
-                            echo "    {"
-                            s9_json_kv "pid" "$pid" "" "    "
-                            s9_json_kv "name" "$name" "" "    "
-                            s9_json_kv "protocol" "UDP" "" "    "
-                            s9_json_kv "local_addr" "$local_addr" "last" "    "
-                            echo -n "    }"
-                        else
-                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
-                                "$pid" "${name:0:20}" "UDP" "$local_addr"
-                        fi
-                        ((found++))
-                    fi
-                done
-            done
-        done < <(tail -n +2 /proc/net/udp 2>/dev/null)
-    fi
-
-    # Check UDPv6 connections
-    if [[ -r /proc/net/udp6 ]]; then
-        while read -r _ local_addr _ _ _ _ _ _ _ inode _; do
-            [[ "$local_addr" == *":$port_hex" ]] || continue
-
-            for proc_dir in /proc/[0-9]*; do
-                local pid="${proc_dir##*/}"
-                [[ -r "$proc_dir/fd" ]] || continue
-
-                for fd in "$proc_dir/fd"/*; do
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null || echo "")
-                    if [[ "$target" == "socket:[$inode]" ]]; then
-                        local name
-                        name=$(s9_get_comm "$pid")
-
-                        if $JSON_MODE; then
-                            if $first; then first=false; else echo ","; fi
-                            echo "    {"
-                            s9_json_kv "pid" "$pid" "" "    "
-                            s9_json_kv "name" "$name" "" "    "
-                            s9_json_kv "protocol" "UDP6" "" "    "
-                            s9_json_kv "local_addr" "$local_addr" "last" "    "
-                            echo -n "    }"
-                        else
-                            printf "  ${S9_CYAN}%-8s${S9_NC} %-20s %-10s %s\n" \
-                                "$pid" "${name:0:20}" "UDP6" "$local_addr"
-                        fi
-                        ((found++))
-                    fi
-                done
-            done
-        done < <(tail -n +2 /proc/net/udp6 2>/dev/null)
-    fi
+    local inode match protocol local_addr
+    for inode in "${!SOCKET_MATCHES[@]}"; do
+        match="${SOCKET_MATCHES[$inode]}"
+        IFS='|' read -r protocol local_addr <<< "$match"
+        emit_socket_match "$inode" "$protocol" "$local_addr"
+    done
 
     if $JSON_MODE; then
         echo ""
         echo "  ],"
-        s9_json_kv "count" "$found" "last"
+        s9_json_kv "count" "$SOCKET_FOUND" "last"
         echo "}"
     else
-        if (( found == 0 )); then
+        if (( SOCKET_FOUND == 0 )); then
             printf "  %bNo processes found using port %s%b\n" "${S9_DIM}" "$target_port" "${S9_NC}"
         else
             echo ""
-            printf "%bFound:%b %d connection(s) on port %s\n" "${S9_BOLD}" "${S9_NC}" "$found" "$target_port"
+            printf "%bFound:%b %d connection(s) on port %s\n" "${S9_BOLD}" "${S9_NC}" "$SOCKET_FOUND" "$target_port"
         fi
     fi
 }
@@ -523,9 +519,10 @@ usage() {
     printf "    --threshold N       FD count threshold for leak detection (default: 100)\n"
     printf "    --top N             Show top N processes in summary (default: 20)\n"
     printf "    -j, --json          Output in JSON format\n"
+    printf "    -e, --export-json   Export JSON to an auto-named file\n"
     printf "    -q, --quiet         Minimal output (for scripting)\n"
     printf "    -h, --help          Show this help\n"
-    printf "    -v, --version       Show version\n\n"
+
 
     printf "%bEXAMPLES:%b\n" "$S9_BOLD" "$S9_NC"
     printf "    s9-fdmap                            # System-wide summary (sorted by FD count)\n"
@@ -539,6 +536,38 @@ usage() {
     printf "    Leak detection shows breakdown: files/sockets/pipes/other\n"
 
     exit 0
+}
+
+fdmap_export_purpose() {
+    if [[ -n "$SEARCH_FILE" ]]; then
+        echo "fdmap-file"
+    elif [[ -n "$SEARCH_SOCKET" ]]; then
+        echo "fdmap-socket"
+    elif $FIND_LEAKS; then
+        echo "fdmap-leaks"
+    else
+        echo "fdmap-summary"
+    fi
+}
+
+run_fdmap() {
+    if ! $JSON_MODE; then
+        echo ""
+    fi
+
+    if [[ -n "$SEARCH_FILE" ]]; then
+        find_file_users "$SEARCH_FILE"
+    elif [[ -n "$SEARCH_SOCKET" ]]; then
+        find_socket_users_indexed "$SEARCH_SOCKET"
+    elif $FIND_LEAKS; then
+        detect_leaks
+    else
+        system_summary
+    fi
+
+    if ! $JSON_MODE; then
+        echo ""
+    fi
 }
 
 main() {
@@ -562,16 +591,21 @@ main() {
             --threshold)
                 [[ $# -ge 2 ]] || s9_die "--threshold requires a value"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Threshold must be a number"
-                LEAK_THRESHOLD="$2"
+                LEAK_THRESHOLD=$((10#$2))
                 shift 2
                 ;;
             --top)
                 [[ $# -ge 2 ]] || s9_die "--top requires a value"
                 [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Top N must be a number"
-                TOP_N="$2"
+                TOP_N=$((10#$2))
                 shift 2
                 ;;
             -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
                 JSON_MODE=true
                 shift
                 ;;
@@ -582,17 +616,17 @@ main() {
             -h|--help)
                 usage
                 ;;
-            -v|--version)
-                echo "s9-fdmap version $S9_VERSION"
-                exit 0
-                ;;
             *)
                 s9_die "Unknown option: $1. Use --help for usage."
                 ;;
         esac
     done
 
-    # Run environment checks after handling cheap flags like --help/--version.
+    if $AUTO_EXPORT_JSON && $QUIET_MODE; then
+        s9_die "-e cannot be combined with --quiet"
+    fi
+
+    # Run environment checks after handling cheap flags like --help.
     s9_init
 
     # Quiet mode: output counts only
@@ -611,23 +645,12 @@ main() {
         return 0
     fi
 
-    if ! $JSON_MODE; then
-        echo ""
-    fi
-
-    # Execute requested operation
-    if [[ -n "$SEARCH_FILE" ]]; then
-        find_file_users "$SEARCH_FILE"
-    elif [[ -n "$SEARCH_SOCKET" ]]; then
-        find_socket_users "$SEARCH_SOCKET"
-    elif $FIND_LEAKS; then
-        detect_leaks
+    if $AUTO_EXPORT_JSON; then
+        local export_file
+        export_file=$(s9_auto_export_path "$(fdmap_export_purpose)")
+        s9_export_json_output "$export_file" run_fdmap
     else
-        system_summary
-    fi
-
-    if ! $JSON_MODE; then
-        echo ""
+        run_fdmap
     fi
 }
 

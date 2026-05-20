@@ -77,10 +77,10 @@ if [[ $# -gt 0 ]]; then
     done
 else
     # Run all tests
-    for test_file in "$TEST_DIR"/test_*.sh; do
+    while IFS= read -r test_file; do
         [[ -e "$test_file" ]] || continue
         run_test_file "$test_file"
-    done
+    done < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.sh' -type f | sort)
 fi
 
 # Summary

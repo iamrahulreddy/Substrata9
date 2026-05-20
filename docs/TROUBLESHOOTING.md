@@ -98,7 +98,41 @@ apk add bc
 
 **Other missing tools?**
 
-If you see errors about `awk`, `sed`, or `grep`, something is very wrong with your system — these are part of the base install on virtually all Linux distributions.
+If you see errors about tools such as `awk`, `sed`, `grep`, `pgrep`, `readlink`, `getconf`, `mktemp`, `sort`, `head`, `tail`, `tr`, `wc`, or `du`, install your distribution's base process/core utilities package. Optional features may also use `timeout`, `realpath`, `getent`, `jq`, or `nvidia-smi`.
+
+
+## GPU PID Attribution in Containers
+
+**What you're seeing:**
+
+`s9-gpu` reports GPU memory, but the PID is `1`, a host PID, or does not match the process that was launched.
+
+**Why it happens:**
+
+In containerized runtimes (Docker, Kubernetes pods, Modal Firecracker microVMs, Colab), `nvidia-smi` reports GPU memory against a PID from the host namespace or against a container init wrapper (such as `dumb-init`). The container's `/proc` only exposes its own PID namespace, so the PID reported by `nvidia-smi` may not correspond to any locally visible process.
+
+**The fix:**
+
+Use `s9-gpu --json` and check the `pid_scope` field:
+- `visible` — the PID is a real local process match (authoritative).
+- `container_proxy` — the PID belongs to a container init wrapper; per-process attribution is unavailable.
+- `host` — the PID is from the host namespace and not locally resolvable.
+
+When `pid_scope` is not `visible`, rely on `gpu_memory_used_mb` as the aggregate GPU memory signal instead of per-process rows.
+
+## Container Memory Reporting
+
+**What you're seeing:**
+
+Substrata9 reports an unrealistically large amount of available memory (e.g., 1.8 TB on a machine that clearly has far less).
+
+**Why it happens:**
+
+`/proc/meminfo` in a container reports the **host machine's** physical RAM, not the container's allocated memory. This is a known Linux kernel behavior.
+
+**The fix:**
+
+Substrata9 automatically detects cgroup memory limits (both v1 and v2) and uses those values when available. If the reported memory still looks incorrect, check whether the container runtime exposes cgroup files at `/sys/fs/cgroup/memory.max` (cgroup v2) or `/sys/fs/cgroup/memory/memory.limit_in_bytes` (cgroup v1).
 
 ## "Process not found" Errors
 
@@ -120,10 +154,10 @@ Processes are transient. The process might have:
 **The fix:**
 
 ```bash
-# Use pgrep to find the current PID
-s9-inspect $(pgrep -n nginx)  # -n = newest matching process
+# Use pgrep to find the current exact-name PID
+s9-inspect $(pgrep -n -x nginx)  # -n = newest, -x = exact name
 
-# Or just use the name — the tool will find it
+# Or just use the exact process name; the tool will find it
 s9-inspect nginx
 
 # If there are multiple matches, you'll be prompted
@@ -163,7 +197,7 @@ s9-tree | less -R
 
 **Using an older terminal?**
 
-Substrata9 detects "dumb" terminals and disables colors automatically. If detection isn't working, set `TERM=dumb` or `NO_COLOR=1`. The release verifier exports `FORCE_COLOR=1` when it starts from a color-capable terminal, so tool output stays colored while being captured with `tee`.
+Substrata9 detects "dumb" terminals and disables colors automatically. If detection isn't working, set `TERM=dumb` or `NO_COLOR=1`. Test workflows can export `FORCE_COLOR=1` when they need colorized output while capturing with `tee`.
 
 ## JSON Output Issues
 
@@ -346,9 +380,8 @@ sudo kill <parent_pid>
 If none of the above helps:
 
 1. **Check the version:**
-   ```bash
-   s9-inspect --version
-   ```
+   Look at the `--help` output header:
+   `s9-inspect --help | head -n 2`
 
 2. **Run with debug output:**
    ```bash

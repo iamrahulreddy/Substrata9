@@ -2,7 +2,7 @@
 
 Comprehensive reference for all tools in the Substrata9 toolkit, with practical examples and real-world context.
 
-> 💡 **See the tools in action!** Check out the [animated demos in the README](../README.md#-demo) or browse the [GIFS/](../GIFS/) folder.
+> 💡 **See the tools in action!** Check out the [animated demos in the README](../README.md#demos) or browse the [GIFS/](../GIFS/) folder.
 
 ## Prerequisites
 
@@ -13,7 +13,8 @@ Requirements:
 | **Operating System** | Linux (Kernel 4.15+, ideally 5.4+) |
 | **Shell** | Bash 4.0 or newer |
 | **Privileges** | Root/sudo recommended for full visibility into all processes |
-| **Dependencies** | `awk`, `sed`, `grep`; `bc` or the bundled lightweight fallback in `bin/bc` |
+| **Dependencies** | `awk`, `sed`, `grep`, `pgrep`, `readlink`, `getconf`, `mktemp`, `sort`, `head`, `tail`, `tr`, `wc`, `du`; `bc` or the bundled lightweight fallback in `bin/bc` |
+| **Optional** | `timeout`, `realpath`, `getent`, `jq`, `nvidia-smi` |
 
 > **Note:** Many `/proc` files require root access. Run with `sudo` for complete visibility.
 
@@ -36,12 +37,9 @@ s9-inspect <PID | process_name> [options]
 | Option | What It Does |
 |--------|--------------|
 | `-f, --full` | Include detailed memory map (heap, stack, shared libraries) |
-| `-e, --env` | Show the process's environment variables |
 | `-q, --quiet` | Minimal output (for scripting) |
-| `--json` | Output as JSON for scripting |
-| `--export FILE` | Save report to FILE (strips colors for text) |
-| `-h, --help` | Show help message |
-| `-v, --version` | Show version |
+| `-j, --json` | Output as JSON for scripting |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
 
 
 ### Examples
@@ -57,10 +55,7 @@ s9-inspect nginx
 s9-inspect $$
 
 # Get the full memory map — see every mapped region
-s9-inspect --full $(pgrep python)
-
-# Include environment variables (careful: may contain secrets!)
-s9-inspect --env 1234
+s9-inspect --full $(pgrep -n -x python)
 
 # Output as JSON for piping to jq or other tools
 s9-inspect 1234 --json | jq '.rss_kb'
@@ -109,7 +104,8 @@ s9-tree [options]
 | `-t, --threads` | Include thread counts for each process |
 | `--no-memory` | Hide memory statistics |
 | `--no-state` | Hide process state indicators |
-| `--json` | Output as JSON |
+| `-j, --json` | Output as JSON |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
 
 > Note: `--user` currently applies to text output only. For JSON workflows, emit the full tree and filter it with `jq`.
 
@@ -161,7 +157,7 @@ s9-tree --no-memory --no-state
 
 ```bash
 # Find the parent that's spawning them all
-s9-tree --pid $(pgrep -o python)
+s9-tree --pid $(pgrep -o -x python)
 # → Shows the process tree rooted at the oldest python process
 ```
 
@@ -188,7 +184,8 @@ s9-fdmap [options]
 | `--leaks` | Scan for processes with suspiciously high FD counts |
 | `--threshold <N>` | FD count threshold for leak detection (default: 100) |
 | `--top <N>` | Show top N processes by FD count (default: 20) |
-| `--json` | Output as JSON |
+| `-j, --json` | Output as JSON |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
 
 
 ### Examples
@@ -251,8 +248,12 @@ s9-snapshot <command> [arguments]
 |---------|--------------|
 | `capture <PID> --name <NAME>` | Save the current state of a process |
 | `list` | Show all saved snapshots |
-| `diff <NAME1> <NAME2>` | Compare two snapshots |
-| `delete <NAME> [--force]` | Delete snapshots matching a name |
+| `diff <NAME1|FILE.snap> <NAME2|FILE.snap> [--latest]` | Compare two snapshots; names must be unambiguous unless `--latest` is used |
+| `delete <NAME|FILE.snap> [--latest|--all] [--force]` | Delete one exact/unambiguous snapshot, the newest match, or all matching snapshots |
+
+All snapshot commands support `-j` / `--json` and `-e` / `--export-json`.
+
+Snapshot names are intentionally conservative: if a name matches multiple saved snapshots, use the exact `.snap` basename shown by `s9-snapshot list`, or pass `--latest`/`--all` where appropriate.
 
 
 ### Examples
@@ -268,10 +269,10 @@ s9-snapshot list
 s9-snapshot capture 1234 --name after_load
 
 # Compare them — see what changed
-s9-snapshot diff baseline after_load
+s9-snapshot diff baseline after_load --latest
 
-# Clean up old snapshots
-s9-snapshot delete baseline --force
+# Clean up old snapshots by exact name, newest match, or all matches
+s9-snapshot delete baseline --latest --force
 ```
 
 
@@ -281,7 +282,7 @@ Standard workflow for tracking down a memory leak:
 
 ```bash
 # Step 1: Find your process
-pid=$(pgrep myapp)
+pid=$(pgrep -n -x myapp)
 
 # Step 2: Capture baseline (right after restart is ideal)
 s9-snapshot capture $pid --name baseline
@@ -293,7 +294,7 @@ sleep 3600  # Wait an hour, or run your load test
 s9-snapshot capture $pid --name after_load
 
 # Step 5: See what grew
-s9-snapshot diff baseline after_load
+s9-snapshot diff baseline after_load --latest
 ```
 
 
@@ -319,6 +320,7 @@ Metrics compared:
 | Variable | What It Does |
 |----------|--------------|
 | `S9_SNAPSHOT_DIR` | Override where snapshots are stored (default: `~/.substrata9/snapshots`) |
+| `S9_EXPORT_TZ` | Timezone for auto-export filenames (default: system timezone; example: `Asia/Kolkata`) |
 
 ## s9-compare — Live Process Comparison
 
@@ -338,9 +340,9 @@ s9-compare <PID1 | process_name1> <PID2 | process_name2> [options]
 
 | Option | What It Does |
 |--------|--------------|
-| `--json` | Output the comparison as JSON |
+| `-j, --json` | Output the comparison as JSON |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
 | `-h, --help` | Show help message |
-| `-v, --version` | Show version |
 
 
 ### Examples
@@ -350,7 +352,7 @@ s9-compare <PID1 | process_name1> <PID2 | process_name2> [options]
 s9-compare 1234 5678
 
 # Compare newest and oldest nginx worker
-s9-compare $(pgrep -n nginx) $(pgrep -o nginx)
+s9-compare $(pgrep -n -x nginx) $(pgrep -o -x nginx)
 
 # Machine-readable comparison
 s9-compare 1234 5678 --json | jq '.assessment'
@@ -378,9 +380,13 @@ s9-anomaly [options]
 | `--hogs` | Only check for resource hogs |
 | `--states` | Only check for unusual process states |
 | `--orphans` | Only check for orphan processes |
+| `--gpu` | Only check for GPU-consuming processes |
 | `--mem-threshold <N>` | Memory threshold percentage (default: 80) |
 | `--fd-threshold <N>` | FD count threshold (default: 500) |
-| `--json` | Output as JSON |
+| `--gpu-threshold <N>` | GPU memory threshold in MB (default: 1024) |
+| `-q, --quiet` | Minimal output (for scripting) |
+| `-j, --json` | Output as JSON |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
 
 
 ### What It Checks
@@ -391,6 +397,9 @@ s9-anomaly [options]
 | **Hogs** | Processes using excessive memory or file descriptors |
 | **States** | Processes stuck in D-state (disk sleep), stopped, etc. |
 | **Orphans** | User processes that got adopted by init (parent died) |
+| **GPU** | Processes consuming NVIDIA GPU memory (requires `nvidia-smi`) |
+
+For containerized GPU runtimes, JSON output includes `pid_scope` and `gpu_memory_used_mb` so callers can distinguish exact PID attribution from aggregate/container-proxy attribution.
 
 
 ### Examples
@@ -427,6 +436,44 @@ s9-anomaly
 #   - Processes stuck in D-state (waiting for slow disk)
 ```
 
+## s9-gpu — NVIDIA GPU Process Visibility
+
+**Function:** Maps running Linux processes to NVIDIA GPU memory allocations.
+
+**Use case:** Identifying which processes are consuming GPU resources on a shared machine.
+
+> Note: GPU PID attribution depends on what `nvidia-smi` can see from the current PID namespace. In containers, `s9-gpu --json` also reports `gpu_memory_used_mb` and `pid_scope` so callers can distinguish exact process matches from host/proxy attribution.
+
+### Syntax
+
+```bash
+s9-gpu [options]
+```
+
+### Options
+
+| Option | What It Does |
+|--------|--------------|
+| `--threshold <N>` | Show processes using at least N MB of GPU memory |
+| `-q, --quiet` | Minimal output (for scripting) |
+| `-j, --json` | Output as JSON |
+| `-e, --export-json` | Auto-save JSON output to a timestamped file |
+| `-h, --help` | Show help message |
+
+### Examples
+
+```bash
+# Show all processes using the GPU
+s9-gpu
+
+# Show processes using more than 1GB of GPU memory
+s9-gpu --threshold 1000
+
+# Export JSON for telemetry
+s9-gpu --export-json
+```
+
+
 ## Troubleshooting
 
 ### "Permission Denied" Errors
@@ -461,10 +508,10 @@ sudo make install
 Processes are transient — they might exit between when you type the command and when it runs.
 
 ```bash
-# Use pgrep to get the current PID
-s9-inspect $(pgrep -n nginx)
+# Use pgrep to get the newest exact-name PID
+s9-inspect $(pgrep -n -x nginx)
 
-# Or just use the name — the tool will find it
+# Or just use the exact process name; the tool will find it
 s9-inspect nginx
 ```
 
@@ -493,11 +540,11 @@ s9-anomaly --hogs 2>/dev/null | head -5
 s9-inspect $(s9-anomaly --hogs 2>/dev/null | awk 'NR==4 {print $1}')
 
 # Monitor a process over time
-pid=$(pgrep myapp)
+pid=$(pgrep -n -x myapp)
 s9-snapshot capture $pid --name t0
 sleep 300
 s9-snapshot capture $pid --name t1
-s9-snapshot diff t0 t1
+s9-snapshot diff t0 t1 --latest
 ```
 
 

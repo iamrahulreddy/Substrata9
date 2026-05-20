@@ -10,7 +10,8 @@ Contributions to Substrata9 are welcome! This document outlines the process for 
 Ensure your development environment meets the following requirements:
 *   Bash 4.0+
 *   `shellcheck` (for linting)
-*   Standard Linux utilities (`awk`, `sed`, `grep`, `bc`)
+*   Standard Linux process/core utilities (`awk`, `sed`, `grep`, `pgrep`, `readlink`, `getconf`, `mktemp`, `sort`, `head`, `tail`, `tr`, `wc`, `du`); `bc` or the bundled fallback
+*   **Optional:** `nvidia-smi` (for GPU tests), `jq` (for JSON schema validation in tests)
 
 ### Getting Started
 
@@ -32,10 +33,12 @@ Ensure your development environment meets the following requirements:
 
 4.  **Verify:**
     Run the test suite and linter to ensure no regressions were introduced.
-    ```bash
-    make test
-    make lint
-    ```
+```bash
+make test
+make lint
+```
+
+For release gating, run JSON-heavy tests in an environment with `jq` available and set `S9_FAIL_ON_SKIP=1` so skipped assertions fail the run instead of being treated as acceptable local omissions.
 
 5.  **Commit and Push:**
     Commit your changes with a clear, descriptive message.
@@ -79,6 +82,7 @@ All contributions must pass the automated test suite.
 *   **Linting:** `make lint`
 
 If adding a new feature, please include a corresponding test case in the `tests/` directory.
+
 
 ---
 

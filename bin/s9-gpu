@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+#
+# s9-gpu - Optional NVIDIA GPU process visibility
+# Substrata9
+#
+# Requirements: bash 4.0+, Linux with /proc filesystem
+#
+
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# Source Common Library
+#------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/s9-common.sh
+source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
+source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
+{ echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+JSON_MODE=false
+QUIET_MODE=false
+GPU_THRESHOLD_MB=0
+AUTO_EXPORT_JSON=false
+
+usage() {
+    cat << EOF
+${S9_BOLD}s9-gpu${S9_NC} - Optional NVIDIA GPU process visibility
+Substrata9 v${S9_VERSION}
+
+${S9_BOLD}USAGE:${S9_NC}
+    s9-gpu [options]
+
+${S9_BOLD}OPTIONS:${S9_NC}
+    --threshold N   Show processes using at least N MB of GPU memory
+    -j, --json      Output in JSON format
+    -e, --export-json
+                    Export JSON to an auto-named file
+    -q, --quiet     Minimal output (for scripting)
+    -h, --help      Show this help
+
+
+EOF
+    exit 0
+}
+
+emit_json() {
+    echo "{"
+    if s9_gpu_available; then
+        s9_json_kv "gpu_available" "true"
+    else
+        s9_json_kv "gpu_available" "false"
+    fi
+    echo "  \"processes\": ["
+
+    local first=true
+    local count=0
+    local row pid process_name gpu_index gpu_name gpu_memory gpu_type pid_scope
+    local proxy_seen=false
+
+    if s9_gpu_available; then
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            IFS='|' read -r pid process_name gpu_index gpu_name gpu_memory gpu_type <<< "$row"
+            [[ "$gpu_memory" =~ ^[0-9]+$ ]] || gpu_memory=0
+            (( gpu_memory >= GPU_THRESHOLD_MB )) || continue
+            pid_scope=$(s9_gpu_pid_scope "$pid" "$process_name")
+            [[ "$pid_scope" == "container_proxy" ]] && proxy_seen=true
+
+            if $first; then first=false; else echo ","; fi
+            echo "    {"
+            s9_json_kv "pid" "$pid" "" "    "
+            s9_json_kv "name" "$process_name" "" "    "
+            s9_json_kv "gpu_index" "$gpu_index" "" "    "
+            s9_json_kv "gpu_name" "$gpu_name" "" "    "
+            s9_json_kv "gpu_memory_mb" "$gpu_memory" "" "    "
+            s9_json_kv "pid_scope" "$pid_scope" "" "    "
+            s9_json_kv "gpu_process_type" "${gpu_type:-compute}" "last" "    "
+            echo -n "    }"
+            ((count++))
+        done < <(s9_gpu_process_rows 2>/dev/null)
+    fi
+
+    echo ""
+    echo "  ],"
+    s9_json_kv "count" "$count"
+    if $proxy_seen; then
+        s9_json_kv "attribution" "container_proxy"
+        s9_json_kv "note" "nvidia-smi reports GPU memory against a container-visible proxy PID; local workload PID mapping may be unavailable"
+    fi
+    # Container-awareness: GPU memory in use but no processes visible
+    if s9_gpu_available && (( count == 0 )); then
+        local mem_used_mb
+        mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null)
+        if (( mem_used_mb > 100 )); then
+            s9_json_kv "gpu_memory_used_mb" "$mem_used_mb"
+            s9_json_kv "note" "GPU memory in use (${mem_used_mb} MB) but process enumeration unavailable (possible container isolation)" "last"
+        else
+            s9_json_kv "gpu_memory_used_mb" "$mem_used_mb" "last"
+        fi
+    else
+        local mem_used_mb
+        mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+        s9_json_kv "gpu_memory_used_mb" "$mem_used_mb" "last"
+    fi
+    echo "}"
+}
+
+emit_text() {
+    s9_box_title "Substrata9 - GPU Processes" "Optional NVIDIA process visibility"
+
+    if ! s9_gpu_available; then
+        printf "  %bGPU process data unavailable (nvidia-smi not found)%b\n" "${S9_DIM}" "${S9_NC}"
+        return 0
+    fi
+
+    printf "  ${S9_BOLD}%-8s %-24s %-8s %-10s %s${S9_NC}\n" "PID" "PROCESS" "GPU" "MEMORY" "GPU NAME"
+    printf "  ${S9_DIM}----------------------------------------------------------------${S9_NC}\n"
+
+    local found=0
+    local row pid process_name gpu_index gpu_name gpu_memory _gpu_type pid_scope
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS='|' read -r pid process_name gpu_index gpu_name gpu_memory _gpu_type <<< "$row"
+        [[ "$gpu_memory" =~ ^[0-9]+$ ]] || gpu_memory=0
+        (( gpu_memory >= GPU_THRESHOLD_MB )) || continue
+        pid_scope=$(s9_gpu_pid_scope "$pid" "$process_name")
+
+        printf "  ${S9_CYAN}%-8s${S9_NC} %-24s %-8s ${S9_YELLOW}%-10s${S9_NC} %s\n" \
+            "$pid" "${process_name:0:24}" "$gpu_index" "${gpu_memory}MB" "${gpu_name:0:28}"
+        [[ "$pid_scope" == "container_proxy" ]] &&
+            printf "  ${S9_DIM}%8s  %s${S9_NC}\n" "" "PID is a container proxy; local workload PID mapping may be unavailable"
+        ((found++))
+    done < <(s9_gpu_process_rows 2>/dev/null)
+
+    echo ""
+    if (( found == 0 )); then
+        local mem_used_mb
+        mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+        if (( mem_used_mb > 100 )); then
+            printf "  %bGPU memory in use (%sMB) but no processes visible%b\n" "${S9_YELLOW}" "$mem_used_mb" "${S9_NC}"
+            printf "  %b(process enumeration may be unavailable due to container isolation)%b\n" "${S9_DIM}" "${S9_NC}"
+        else
+            printf "  %bNo visible GPU processes matched the threshold%b\n" "${S9_GREEN}" "${S9_NC}"
+        fi
+    else
+        printf "  %bFound:%b %d visible GPU process(es)\n" "${S9_BOLD}" "${S9_NC}" "$found"
+    fi
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --threshold)
+                [[ $# -ge 2 ]] || s9_die "--threshold requires a value"
+                [[ "$2" =~ ^[0-9]+$ ]] || s9_die "Threshold must be a number"
+                GPU_THRESHOLD_MB=$((10#$2))
+                shift 2
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -e|--export-json)
+                AUTO_EXPORT_JSON=true
+                JSON_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+
+            *)
+                s9_die "Unknown option: $1. Use --help for usage."
+                ;;
+        esac
+    done
+
+    if $AUTO_EXPORT_JSON && $QUIET_MODE; then
+        s9_die "-e cannot be combined with --quiet"
+    fi
+
+    s9_init
+
+    if $QUIET_MODE; then
+        local count=0
+        local mem_used_mb=0
+        if s9_gpu_available; then
+            count=$(s9_gpu_process_rows 2>/dev/null | awk -F'|' -v threshold="$GPU_THRESHOLD_MB" '$5 >= threshold {count++} END {print count + 0}') || count=0
+            mem_used_mb=$(s9_gpu_memory_used_mb 2>/dev/null || echo 0)
+        fi
+        echo "GPU_AVAILABLE=$(s9_gpu_available && echo true || echo false) GPU_PROCESSES=$count GPU_MEMORY_USED_MB=$mem_used_mb"
+        return 0
+    fi
+
+    if $AUTO_EXPORT_JSON; then
+        local export_file
+        export_file=$(s9_auto_export_path "gpu")
+        s9_export_json_output "$export_file" emit_json
+    elif $JSON_MODE; then
+        emit_json
+    else
+        emit_text
+    fi
+}
+
+main "$@"

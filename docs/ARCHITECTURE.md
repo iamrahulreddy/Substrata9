@@ -2,7 +2,7 @@
 
 Technical overview of the toolkit's design, data flow, and internal structure.
 
-> 🎬 **Want to see these tools in action?** Check the [animated demos](../README.md#-demo) or browse `GIFS/`.
+> 🎬 **Want to see these tools in action?** Check the [animated demos](../README.md#demos) or browse `GIFS/`.
 
 ## Overview
 
@@ -22,7 +22,8 @@ Here's the high-level structure:
 │   │ s9-fdmap    │───────────────▶│                 │            │
 │   │ s9-snapshot │───────────────▶│  Colors, I/O,   │            │
 │   │ s9-compare  │───────────────▶│  Formatting,    │            │
-│   │ s9-anomaly  │───────────────▶│  /proc helpers  │            │
+│   │ s9-anomaly  │───────────────▶│  /proc helpers, │            │
+│   │ s9-gpu      │───────────────▶│  GPU helpers    │            │
 │   └─────────────┘                └─────────────────┘            │
 │         │                                                       │
 │         ▼                                                       │
@@ -35,7 +36,6 @@ Here's the high-level structure:
 │   /proc/[pid]/maps      → Memory regions                        │
 │   /proc/[pid]/io        → I/O statistics                        │
 │   /proc/[pid]/cmdline   → Command line arguments                │
-│   /proc/[pid]/environ   → Environment variables                 │
 │   /proc/[pid]/limits    → Resource limits                       │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -64,7 +64,7 @@ source "${SCRIPT_DIR}/../lib/s9-common.sh"
 s9_init  # Validates the runtime environment before Linux/proc work
 ```
 
-Tools handle cheap flags such as `--help` and `--version` before calling `s9_init`, so users can read usage text without needing Linux `/proc` access or every runtime dependency available. Here's what the library handles:
+Tools handle cheap flags such as `--help` before calling `s9_init`, so users can read usage text without needing Linux `/proc` access or every runtime dependency available. Here's what the library handles:
 
 | Category | Functions | What They Do |
 |----------|-----------|--------------|
@@ -84,7 +84,7 @@ Detailed breakdown of each tool's operation.
 
 ### s9-inspect
 
-Deep inspection of a single process. Accepts a PID or process name.
+Deep inspection of a single process. Accepts a PID or exact process name.
 
 **Data Flow:**
 
@@ -268,6 +268,7 @@ System-wide health check that identifies common issues.
 | **FD Hogs** | Count FDs per process, flag if above threshold |
 | **D-State** | Find processes stuck in uninterruptible sleep (often I/O issues) |
 | **Orphans** | Find user processes whose parent is PID 1 (got adopted by init) |
+| **GPU** | Query `nvidia-smi` for processes consuming GPU memory above threshold |
 
 Uses `set -uo pipefail` instead of `set -euo pipefail`. The `-e` flag exits on any error, but when scanning `/proc`, processes can terminate between listing and reading. This approach handles race conditions gracefully rather than crashing.
 
@@ -280,7 +281,7 @@ Uses `set -uo pipefail` instead of `set -euo pipefail`. The `-e` flag exits on a
 | **Direct /proc access** | Source of truth, no dependency on `ps`/`top` | Kernel changes could break parsing |
 | **Associative arrays** | O(1) lookups for tree building | Requires Bash 4.0+ |
 | **Text snapshots** | Human-readable, easy to debug | Not efficient for high-frequency capture |
-| **No external dependencies** | Works on minimal systems | Can't use `jq` for JSON parsing internally |
+| **No non-standard dependencies** | Works on minimal systems with Bash and core Linux utilities | Can't use `jq` for JSON parsing internally |
 
 
 ### Language Choice

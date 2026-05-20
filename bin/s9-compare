@@ -17,14 +17,22 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/s9-common.sh
 source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null || \
+source "${SCRIPT_DIR}/../lib/substrata9/s9-common.sh" 2>/dev/null || \
 source "/usr/local/lib/substrata9/s9-common.sh" 2>/dev/null || \
 { echo "Error: Cannot find s9-common.sh library"; exit 1; }
+
+S9_COMPARE_TEMP_DIR=""
+
+_s9_compare_cleanup() {
+    [[ -n "${S9_COMPARE_TEMP_DIR:-}" ]] && rm -rf -- "$S9_COMPARE_TEMP_DIR"
+}
 
 #------------------------------------------------------------------------------
 # Main
 #------------------------------------------------------------------------------
 
 usage() {
+    local exit_code="${1:-0}"
     cat << EOF
 ${S9_BOLD}s9-compare${S9_NC} - Compare two live processes
 Substrata9 v${S9_VERSION}
@@ -34,8 +42,10 @@ ${S9_BOLD}USAGE:${S9_NC}
 
 ${S9_BOLD}OPTIONS:${S9_NC}
     -j, --json      Output in JSON format
+    -e, --export-json
+                    Export JSON to an auto-named file
     -h, --help      Show this help
-    -v, --version   Show version
+
 
 ${S9_BOLD}DESCRIPTION:${S9_NC}
     Captures snapshots of two running processes and compares their
@@ -44,16 +54,17 @@ ${S9_BOLD}DESCRIPTION:${S9_NC}
 
 ${S9_BOLD}EXAMPLES:${S9_NC}
     s9-compare 1234 5678
-    s9-compare \$(pgrep -n nginx) \$(pgrep -o nginx)
+    s9-compare \$(pgrep -n -x nginx) \$(pgrep -o -x nginx)
 
 EOF
-    exit 0
+    exit "$exit_code"
 }
 
 main() {
     local pid1=""
     local pid2=""
     local json_mode=false
+    local auto_export_json=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -62,13 +73,15 @@ main() {
                 json_mode=true
                 shift
                 ;;
+            -e|--export-json)
+                auto_export_json=true
+                json_mode=true
+                shift
+                ;;
             -h|--help)
-                usage
+                usage 0
                 ;;
-            -v|--version)
-                echo "s9-compare version $S9_VERSION"
-                exit 0
-                ;;
+
             -*)
                 s9_die "Unknown option: $1"
                 ;;
@@ -85,9 +98,9 @@ main() {
         esac
     done
 
-    [[ -n "$pid1" ]] && [[ -n "$pid2" ]] || usage
+    [[ -n "$pid1" ]] && [[ -n "$pid2" ]] || usage 1
 
-    # Run environment checks after handling cheap flags like --help/--version.
+    # Run environment checks after handling cheap flags like --help.
     s9_init
 
     # Resolve PIDs
@@ -102,8 +115,8 @@ main() {
     local temp_dir
     temp_dir=$(mktemp -d) || s9_die "Cannot create temp directory"
 
-    # Ensure cleanup on exit
-    trap "rm -rf '$temp_dir'" EXIT
+    S9_COMPARE_TEMP_DIR="$temp_dir"
+    trap _s9_compare_cleanup EXIT
 
     # Export S9_SNAPSHOT_DIR to override s9-snapshot location
     export S9_SNAPSHOT_DIR="$temp_dir"
@@ -134,13 +147,20 @@ main() {
     local -a json_args=()
     $json_mode && json_args+=(--json)
 
-    "${snapshot_cmd[@]}" capture "$pid1" --name "proc1" "${json_args[@]}" >/dev/null
+    "${snapshot_cmd[@]}" capture "$pid1" --name "proc1" "${json_args[@]}" >/dev/null || exit 1
 
     # Capture PID2
-    "${snapshot_cmd[@]}" capture "$pid2" --name "proc2" "${json_args[@]}" >/dev/null
+    "${snapshot_cmd[@]}" capture "$pid2" --name "proc2" "${json_args[@]}" >/dev/null || exit 1
 
     # Diff them
-    "${snapshot_cmd[@]}" diff "proc1" "proc2" "${json_args[@]}"
+    local -a diff_cmd=("${snapshot_cmd[@]}" diff "proc1" "proc2" "${json_args[@]}")
+    if $auto_export_json; then
+        local export_file
+        export_file=$(s9_auto_export_path "compare")
+        s9_export_json_output "$export_file" "${diff_cmd[@]}"
+    else
+        "${diff_cmd[@]}"
+    fi
 }
 
 main "$@"

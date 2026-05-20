@@ -39,13 +39,12 @@ help:
 check-deps:
 	@echo "Checking dependencies..."
 	@command -v bash >/dev/null 2>&1 || { echo "❌ bash not found"; exit 1; }
-	@echo "✓ bash found: $$(bash --version | head -1)"
-	@command -v awk >/dev/null 2>&1 || { echo "❌ awk not found"; exit 1; }
-	@echo "✓ awk found"
-	@command -v grep >/dev/null 2>&1 || { echo "❌ grep not found"; exit 1; }
-	@echo "✓ grep found"
-	@command -v sed >/dev/null 2>&1 || { echo "❌ sed not found"; exit 1; }
-	@echo "✓ sed found"
+	@echo "✓ bash found"
+	@for cmd in awk sed grep pgrep readlink getconf mktemp sort head tail tr wc du; do \
+		command -v "$$cmd" >/dev/null 2>&1 || { echo "❌ $$cmd not found"; exit 1; }; \
+		echo "✓ $$cmd found"; \
+	done
+	@command -v getent >/dev/null 2>&1 || echo "getent not found; UID lookups will fall back to id"
 	@bc_path="$$(command -v bc 2>/dev/null || true)"; \
 	if [ -z "$$bc_path" ] || [ ! -x "$$bc_path" ]; then \
 		if [ -f "$(CURDIR)/bin/bc" ]; then \
@@ -63,7 +62,7 @@ install: check-deps
 	@echo "Installing Substrata9 v$(VERSION) to $(PREFIX)..."
 	@echo ""
 	@# Create directories
-	@mkdir -p "$(BINDIR)" "$(LIBDIR)" "$(DOCDIR)"
+	@mkdir -p "$(BINDIR)" "$(LIBDIR)/bin" "$(DOCDIR)"
 	@# Install binaries
 	@for script in $(SCRIPTS); do \
 		echo "  Installing $$script → $(BINDIR)/"; \
@@ -72,6 +71,9 @@ install: check-deps
 	@# Install library
 	@echo "  Installing lib/s9-common.sh → $(LIBDIR)/"
 	@install -m 644 lib/s9-common.sh "$(LIBDIR)/"
+	@# Install bundled calculator fallback for systems without bc
+	@echo "  Installing bin/bc fallback -> $(LIBDIR)/bin/"
+	@install -m 755 bin/bc "$(LIBDIR)/bin/bc"
 	@# Install documentation
 	@echo "  Installing documentation → $(DOCDIR)/"
 	@install -m 644 README.md "$(DOCDIR)/"

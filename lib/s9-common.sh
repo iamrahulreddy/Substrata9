@@ -14,13 +14,19 @@
 # Prevent double-sourcing
 [[ -n "${S9_COMMON_LOADED:-}" ]] && return 0
 S9_COMMON_LOADED=1
+S9_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || echo "")"
 # Project root (one level up from this lib directory)
-S9_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd || echo "")"
+if [[ -n "$S9_COMMON_DIR" ]]; then
+    S9_ROOT="$(cd "$S9_COMMON_DIR/.." >/dev/null 2>&1 && pwd || echo "")"
+else
+    S9_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd || echo "")"
+fi
 
 #------------------------------------------------------------------------------
 # Version
 #------------------------------------------------------------------------------
-S9_VERSION="1.2.1"
+# shellcheck disable=SC2034
+S9_VERSION="1.3.1"
 
 #------------------------------------------------------------------------------
 # Colors (with terminal detection)
@@ -85,21 +91,12 @@ s9_header() {
     local width=66
     local title_len=${#title}
     local padding=$(( (width - title_len - 4) / 2 ))
-    local pad_left=$(printf '─%.0s' $(seq 1 $padding))
-    local pad_right=$(printf '─%.0s' $(seq 1 $((width - title_len - 4 - padding))))
+    local pad_left pad_right
+    pad_left=$(printf '─%.0s' $(seq 1 $padding))
+    pad_right=$(printf '─%.0s' $(seq 1 $((width - title_len - 4 - padding))))
 
     echo ""
     printf "%b%b┌%s %s %s┐%b\n" "${S9_BOLD}" "${S9_BLUE}" "$pad_left" "$title" "$pad_right" "${S9_NC}"
-    echo ""
-}
-
-s9_subheader() {
-    echo ""
-    printf "%b%s%b\n" "${S9_BOLD}" "$1" "${S9_NC}"
-    printf "%b%s%b\n" "${S9_DIM}" "$(printf '─%.0s' $(seq 1 ${#1}))" "${S9_NC}"
-}
-
-s9_separator() {
     echo ""
 }
 
@@ -113,65 +110,14 @@ s9_kv() {
     local width="${3:-18}"
     local color="${4:-}"
 
+    # Guard: ensure width is numeric to prevent printf format string issues
+    [[ "$width" =~ ^[0-9]+$ ]] || width=18
+
     if [[ -n "$color" ]]; then
         printf "  %b%-${width}s%b %b%s%b\n" "${S9_BOLD}" "$label:" "${S9_NC}" "$color" "$value" "${S9_NC}"
     else
         printf "  %b%-${width}s%b %s\n" "${S9_BOLD}" "$label:" "${S9_NC}" "$value"
     fi
-}
-
-s9_status() {
-    local type="$1"
-    local msg="$2"
-
-    case "$type" in
-        ok|success)
-            printf "  %b✓%b %s\n" "${S9_GREEN}" "${S9_NC}" "$msg"
-            ;;
-        warn|warning)
-            printf "  %b⚠%b %s\n" "${S9_YELLOW}" "${S9_NC}" "$msg"
-            ;;
-        error|fail)
-            printf "  %b✗%b %s\n" "${S9_RED}" "${S9_NC}" "$msg"
-            ;;
-        info)
-            printf "  %b●%b %s\n" "${S9_CYAN}" "${S9_NC}" "$msg"
-            ;;
-        *)
-            printf "  %b·%b %s\n" "${S9_DIM}" "${S9_NC}" "$msg"
-            ;;
-    esac
-}
-
-s9_bar() {
-    local label="$1"
-    local current="$2"
-    local max="$3"
-    local width="${4:-20}"
-
-    local percent=0
-    if (( max > 0 )); then
-        percent=$(( (current * 100) / max ))
-    fi
-
-    local filled=$(( (percent * width) / 100 ))
-    local empty=$(( width - filled ))
-
-    local bar=""
-    local color="$S9_GREEN"
-    if (( percent > 80 )); then
-        color="$S9_RED"
-    elif (( percent > 60 )); then
-        color="$S9_YELLOW"
-    fi
-
-    bar+=$(printf '%b' "$color")
-    bar+=$(printf '█%.0s' $(seq 1 $filled) 2>/dev/null || true)
-    bar+=$(printf '%b' "${S9_DIM}")
-    bar+=$(printf '░%.0s' $(seq 1 $empty) 2>/dev/null || true)
-    bar+=$(printf '%b' "${S9_NC}")
-
-    printf "  %-12s [%s] %3d%%\n" "$label" "$bar" "$percent"
 }
 
 s9_box_title() {
@@ -224,7 +170,9 @@ s9_json_kv() {
     local indent="${4:-}"
     local sanitized_val
 
-    if [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || [[ "$val" == "true" ]] || [[ "$val" == "false" ]] || [[ "$val" == "null" ]]; then
+    if [[ "$val" == "true" ]] || [[ "$val" == "false" ]] || [[ "$val" == "null" ]]; then
+        sanitized_val="$val"
+    elif [[ "$val" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
         sanitized_val="$val"
     else
         sanitized_val="\"$(s9_sanitize_json "$val")\""
@@ -234,6 +182,59 @@ s9_json_kv() {
         printf "%s  \"%s\": %s\n" "$indent" "$key" "$sanitized_val"
     else
         printf "%s  \"%s\": %s,\n" "$indent" "$key" "$sanitized_val"
+    fi
+}
+
+s9_auto_export_path() {
+    local purpose="$1"
+    local safe_purpose timestamp export_tz base path suffix
+
+    safe_purpose=$(printf "%s" "$purpose" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-][^a-z0-9_-]*/-/g; s/^-//; s/-$//')
+    [[ -n "$safe_purpose" ]] || safe_purpose="report"
+
+    export_tz="${S9_EXPORT_TZ:-}"
+    if [[ -n "$export_tz" ]]; then
+        timestamp=$(TZ="$export_tz" date '+%Y-%m-%d_%H-%M-%S_%Z' 2>/dev/null) || {
+            s9_warn "Invalid S9_EXPORT_TZ '$export_tz'; using system timezone"
+            timestamp=$(date '+%Y-%m-%d_%H-%M-%S_%Z')
+        }
+    else
+        timestamp=$(date '+%Y-%m-%d_%H-%M-%S_%Z')
+    fi
+    timestamp=$(printf "%s" "$timestamp" | sed 's/[^a-zA-Z0-9_-]/-/g')
+
+    base="s9-${safe_purpose}_${timestamp}"
+    path="${base}.json"
+    suffix=1
+
+    while [[ -e "$path" ]]; do
+        path="${base}_${suffix}.json"
+        suffix=$((suffix + 1))
+    done
+
+    printf "%s\n" "$path"
+}
+
+s9_export_json_output() {
+    local export_file="$1"
+    shift
+
+    [[ -n "$export_file" ]] || s9_die "Export file path is required"
+    (( $# > 0 )) || s9_die "Export command is required"
+
+    local capture_file
+    capture_file=$(mktemp) || s9_die "Cannot create temp file"
+
+    if "$@" | tee "$capture_file"; then
+        cp "$capture_file" "$export_file" || {
+            rm -f "$capture_file"
+            s9_die "Cannot write export file: $export_file"
+        }
+        rm -f "$capture_file"
+        s9_info "JSON exported to $export_file" >&2
+    else
+        rm -f "$capture_file"
+        s9_die "Failed to generate JSON export"
     fi
 }
 
@@ -250,11 +251,17 @@ s9_human_bytes() {
     fi
 
     if (( bytes >= 1073741824 )); then
-        printf "%.2f GB" "$(echo "scale=2; $bytes/1073741824" | s9_calc)"
+        local int_val=$(( bytes / 1073741824 ))
+        local dec_val=$(( (bytes * 100 / 1073741824) % 100 ))
+        printf "%d.%02d GB" "$int_val" "$dec_val"
     elif (( bytes >= 1048576 )); then
-        printf "%.2f MB" "$(echo "scale=2; $bytes/1048576" | s9_calc)"
+        local int_val=$(( bytes / 1048576 ))
+        local dec_val=$(( (bytes * 100 / 1048576) % 100 ))
+        printf "%d.%02d MB" "$int_val" "$dec_val"
     elif (( bytes >= 1024 )); then
-        printf "%.2f KB" "$(echo "scale=2; $bytes/1024" | s9_calc)"
+        local int_val=$(( bytes / 1024 ))
+        local dec_val=$(( (bytes * 100 / 1024) % 100 ))
+        printf "%d.%02d KB" "$int_val" "$dec_val"
     else
         printf "%d B" "$bytes"
     fi
@@ -291,12 +298,6 @@ s9_human_duration() {
 # Validation Functions
 #------------------------------------------------------------------------------
 
-s9_require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        s9_die "This operation requires root privileges. Try: sudo $0 $*"
-    fi
-}
-
 s9_check_bash_version() {
     if (( BASH_VERSINFO[0] < 4 )); then
         s9_die "This script requires bash 4.0 or later (found $BASH_VERSION)"
@@ -322,16 +323,25 @@ s9_find_bc() {
         printf "%s\n" "$bc_path"
         return 0
     fi
+
+    local fallback
+    for fallback in "${S9_ROOT:-}/bin/bc" "${S9_ROOT:-}/bc" "${S9_COMMON_DIR:-}/bin/bc" "${S9_COMMON_DIR:-}/bc"; do
+        if [[ -f "$fallback" ]]; then
+            printf "%s\n" "$fallback"
+            return 0
+        fi
+    done
+
     return 1
 }
 
 s9_check_bc() {
-    if s9_find_bc >/dev/null; then
-        return 0
-    fi
-
-    if [[ -n "${S9_ROOT:-}" && -f "$S9_ROOT/bin/bc" ]]; then
-        s9_warn "system 'bc' not found; using local fallback via bash: $S9_ROOT/bin/bc"
+    local bc_path
+    if bc_path=$(s9_find_bc); then
+        if [[ "${bc_path##*/}" == "bc" && "$bc_path" == "${S9_ROOT:-}"* && "$bc_path" != "$(command -v bc 2>/dev/null || true)" ]]; then
+            # s9_warn "system 'bc' not found; using local fallback via bash: $bc_path"
+            :
+        fi
         return 0
     fi
 
@@ -341,12 +351,11 @@ s9_check_bc() {
 s9_calc() {
     local bc_path
     if bc_path=$(s9_find_bc); then
-        "$bc_path" "$@"
-        return
-    fi
-
-    if [[ -n "${S9_ROOT:-}" && -f "$S9_ROOT/bin/bc" ]]; then
-        bash "$S9_ROOT/bin/bc" "$@"
+        if [[ "$bc_path" == "${S9_ROOT:-}/bin/bc" || "$bc_path" == "${S9_ROOT:-}/bc" || "$bc_path" == "${S9_COMMON_DIR:-}/bin/bc" || "$bc_path" == "${S9_COMMON_DIR:-}/bc" ]]; then
+            bash "$bc_path" "$@"
+        else
+            "$bc_path" "$@"
+        fi
         return
     fi
 
@@ -368,14 +377,40 @@ s9_process_exists() {
     [[ -d "/proc/$1" ]]
 }
 
+declare -g -A S9_UID_CACHE=()
+
+_s9_get_status_field() {
+    local pid="$1"
+    local target_key="$2"
+    local fallback="${3:-}"
+    local key val
+
+    [[ -r "/proc/$pid/status" ]] || { echo "$fallback"; return 1; }
+
+    while IFS=: read -r key val; do
+        key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+        if [[ "$key" == "$target_key" ]]; then
+            val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+            echo "${val%%[[:space:]]*}"
+            return 0
+        fi
+    done < "/proc/$pid/status"
+
+    echo "$fallback"
+    return 1
+}
+
 s9_get_comm() {
     local name
-    name=$(s9_read_proc_file "/proc/$1/comm") || name="unknown"
-    s9_sanitize_display "$name"
+    if read -r -t 2 name < "/proc/$1/comm" 2>/dev/null; then
+        s9_sanitize_display "$name"
+    else
+        echo "unknown"
+    fi
 }
 
 s9_get_state() {
-    awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null
+    _s9_get_status_field "$1" "State" ""
 }
 
 s9_get_state_desc() {
@@ -394,36 +429,217 @@ s9_get_state_desc() {
 }
 
 s9_get_ppid() {
-    awk '/^PPid:/ {print $2}' "/proc/$1/status" 2>/dev/null
+    _s9_get_status_field "$1" "PPid" ""
 }
 
 s9_get_rss() {
-    awk '/^VmRSS:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "0"
-}
-
-s9_get_vmsize() {
-    awk '/^VmSize:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "0"
+    _s9_get_status_field "$1" "VmRSS" "0"
 }
 
 s9_get_threads() {
-    awk '/^Threads:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo "1"
-}
-
-s9_get_uid() {
-    awk '/^Uid:/ {print $2}' "/proc/$1/status" 2>/dev/null
+    _s9_get_status_field "$1" "Threads" "1"
 }
 
 s9_uid_to_user() {
-    getent passwd "$1" 2>/dev/null | cut -d: -f1 || echo "$1"
+    local uid="$1"
+    [[ -n "$uid" ]] || return 1
+
+    if [[ -n "${S9_UID_CACHE[$uid]:-}" ]]; then
+        echo "${S9_UID_CACHE[$uid]}"
+        return 0
+    fi
+
+    local user
+    if command -v getent >/dev/null 2>&1; then
+        user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1) || user="$uid"
+    else
+        user="$uid"
+    fi
+    if [[ "$user" == "$uid" ]] && command -v id >/dev/null 2>&1; then
+        user=$(id -nu "$uid" 2>/dev/null || printf "%s" "$uid")
+    fi
+    [[ -n "$user" ]] || user="$uid"
+    S9_UID_CACHE[$uid]="$user"
+    echo "$user"
 }
 
 s9_get_fd_count() {
     local pid=$1
     if [[ -r "/proc/$pid/fd" ]]; then
-        ls -1 -- "/proc/$pid/fd" 2>/dev/null | wc -l
+        local fds=(/proc/"$pid"/fd/*)
+        if [[ "${fds[0]:-}" == "/proc/$pid/fd/*" ]] && [[ ! -e "${fds[0]:-}" ]]; then
+            echo "0"
+        else
+            echo "${#fds[@]}"
+        fi
     else
         echo "0"
     fi
+}
+
+s9_fd_type() {
+    local target="$1"
+
+    case "$target" in
+        socket:*) echo "socket" ;;
+        pipe:*) echo "pipe" ;;
+        /dev/*) echo "device" ;;
+        anon_inode:*) echo "anon" ;;
+        *) echo "file" ;;
+    esac
+}
+
+s9_nvidia_smi_cmd() {
+    local smi="${S9_NVIDIA_SMI:-nvidia-smi}"
+    command -v "$smi" >/dev/null 2>&1 || return 1
+    printf "%s\n" "$smi"
+}
+
+s9_gpu_available() {
+    local smi gpu_rows
+    smi=$(s9_nvidia_smi_cmd) || return 1
+    gpu_rows=$("$smi" --query-gpu=index --format=csv,noheader,nounits 2>/dev/null) || return 1
+    [[ -n "$(s9_trim "$gpu_rows")" ]]
+}
+
+s9_trim() {
+    local input="$1"
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    printf "%s\n" "$input"
+}
+
+s9_gpu_process_rows() {
+    local smi
+    smi=$(s9_nvidia_smi_cmd) || return 1
+
+    local gpu_rows app_rows
+    gpu_rows=$("$smi" --query-gpu=index,uuid,name --format=csv,noheader,nounits 2>/dev/null) || return 1
+    [[ -n "$(s9_trim "$gpu_rows")" ]] || return 1
+    app_rows=$("$smi" --query-compute-apps=pid,process_name,gpu_uuid,used_memory --format=csv,noheader,nounits 2>/dev/null) || return 1
+    [[ -n "$app_rows" ]] || return 0
+
+    local -A gpu_index=()
+    local -A gpu_name=()
+    local idx uuid gpu_name_raw i
+
+    local gpu_line
+    local -a gpu_cols
+    while IFS= read -r gpu_line; do
+        IFS=',' read -ra gpu_cols <<< "$gpu_line"
+        (( ${#gpu_cols[@]} >= 3 )) || continue
+        idx="${gpu_cols[0]}"
+        uuid="${gpu_cols[1]}"
+        gpu_name_raw=""
+        for (( i=2; i<${#gpu_cols[@]}; i++ )); do
+            [[ -n "$gpu_name_raw" ]] && gpu_name_raw+=","
+            gpu_name_raw+="${gpu_cols[$i]}"
+        done
+
+        idx=$(s9_trim "${idx:-}")
+        uuid=$(s9_trim "${uuid:-}")
+        gpu_name_raw=$(s9_trim "${gpu_name_raw:-}")
+        gpu_name_raw="${gpu_name_raw//|/ }"
+        [[ -n "$uuid" ]] || continue
+        gpu_index[$uuid]="$idx"
+        gpu_name[$uuid]="$gpu_name_raw"
+    done <<< "$gpu_rows"
+
+    local pid proc_name gpu_uuid used_memory
+    local app_line col_count
+    local -a app_cols
+    while IFS= read -r app_line; do
+        IFS=',' read -ra app_cols <<< "$app_line"
+        col_count=${#app_cols[@]}
+        (( col_count >= 4 )) || continue
+
+        pid="${app_cols[0]}"
+        gpu_uuid="${app_cols[$((col_count - 2))]}"
+        used_memory="${app_cols[$((col_count - 1))]}"
+        proc_name=""
+        for (( i=1; i<col_count-2; i++ )); do
+            [[ -n "$proc_name" ]] && proc_name+=","
+            proc_name+="${app_cols[$i]}"
+        done
+
+        pid=$(s9_trim "${pid:-}")
+        proc_name=$(s9_trim "${proc_name:-}")
+        gpu_uuid=$(s9_trim "${gpu_uuid:-}")
+        used_memory=$(s9_trim "${used_memory:-}")
+        proc_name="${proc_name//|/ }"
+
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ -n "$gpu_uuid" ]] || gpu_uuid="unknown"
+        [[ "$used_memory" =~ ^[0-9]+$ ]] || used_memory=0
+
+        printf "%s|%s|%s|%s|%s|compute\n" \
+            "$pid" \
+            "$(s9_sanitize_display "$proc_name")" \
+            "${gpu_index[$gpu_uuid]:-$gpu_uuid}" \
+            "$(s9_sanitize_display "${gpu_name[$gpu_uuid]:-$gpu_uuid}")" \
+            "$used_memory"
+    done <<< "$app_rows"
+}
+
+s9_gpu_process_for_pid() {
+    local pid="$1"
+    s9_gpu_process_rows 2>/dev/null | awk -F'|' -v target="$pid" '
+        $1 == target {
+            print
+            found = 1
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    '
+}
+
+s9_gpu_pid_scope() {
+    local pid="$1"
+    local reported_name="${2:-}"
+    local reported_base="${reported_name##*/}"
+    local comm cmdline
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || { echo "unknown"; return 0; }
+    if [[ ! -d "/proc/$pid" ]]; then
+        echo "host"
+        return 0
+    fi
+
+    comm=$(s9_get_comm "$pid" 2>/dev/null || echo "")
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || echo "")
+
+    if [[ "$pid" == "1" ]] &&
+       { [[ "$comm" == "dumb-init" || "$comm" == "tini" || "$comm" == "init" ]] ||
+         [[ "$cmdline" == *"dumb-init"* || "$cmdline" == *"tini"* ]]; }; then
+        echo "container_proxy"
+    elif [[ -n "$reported_base" && -n "$comm" && "$reported_base" != "$comm"* && "$comm" != "$reported_base"* ]]; then
+        echo "name_mismatch"
+    else
+        echo "visible"
+    fi
+}
+
+s9_gpu_process_count() {
+    local count
+    count=$(s9_gpu_process_rows 2>/dev/null | awk 'NF {count++} END {print count + 0}') || count=0
+    printf "%s\n" "$count"
+}
+
+s9_gpu_memory_used_mb() {
+    local smi
+    smi=$(s9_nvidia_smi_cmd) || { echo 0; return 0; }
+    local used
+    used=$("$smi" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null |
+        awk '
+            {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+                if ($1 ~ /^[0-9]+$/) total += $1
+            }
+            END { print total + 0 }
+        ')
+    used=$(s9_trim "${used:-0}")
+    printf "%s\n" "$used"
 }
 
 s9_get_stat_field() {
@@ -444,49 +660,6 @@ s9_get_stat_field() {
     echo "${fields[$idx]}"
 }
 
-s9_check_namespace() {
-    local pid=$1
-
-    if [[ -f "/proc/$pid/cgroup" ]]; then
-        local cgroup_content
-        cgroup_content=$(cat "/proc/$pid/cgroup" 2>/dev/null) || cgroup_content=""
-
-        if [[ "$cgroup_content" == *"docker"* ]]; then
-            echo "docker"; return 0
-        elif [[ "$cgroup_content" == *"containerd"* ]]; then
-            echo "containerd"; return 0
-        elif [[ "$cgroup_content" == *"lxc"* ]]; then
-            echo "lxc"; return 0
-        elif [[ "$cgroup_content" == *"kubepods"* ]] || [[ "$cgroup_content" == *"kubelet"* ]]; then
-            echo "k8s"; return 0
-        elif [[ "$cgroup_content" == *"podman"* ]]; then
-            echo "podman"; return 0
-        fi
-    fi
-
-    if [[ -r "/proc/$pid/ns/pid" ]] && [[ -r "/proc/1/ns/pid" ]]; then
-        local pid_ns init_ns
-        pid_ns=$(readlink "/proc/$pid/ns/pid" 2>/dev/null || echo "")
-        init_ns=$(readlink "/proc/1/ns/pid" 2>/dev/null || echo "")
-
-        if [[ -n "$pid_ns" ]] && [[ -n "$init_ns" ]] && [[ "$pid_ns" != "$init_ns" ]]; then
-            echo "namespace"; return 0
-        fi
-    fi
-
-    if [[ -r "/proc/$pid/ns/mnt" ]] && [[ -r "/proc/1/ns/mnt" ]]; then
-        local mnt_ns init_mnt_ns
-        mnt_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "")
-        init_mnt_ns=$(readlink "/proc/1/ns/mnt" 2>/dev/null || echo "")
-
-        if [[ -n "$mnt_ns" ]] && [[ -n "$init_mnt_ns" ]] && [[ "$mnt_ns" != "$init_mnt_ns" ]]; then
-            echo "namespace"; return 0
-        fi
-    fi
-
-    echo ""
-}
-
 s9_validate_number() {
     local value="$1"
     local name="${2:-value}"
@@ -502,7 +675,16 @@ s9_sanitize_filename() {
 
 s9_sanitize_display() {
     local input="$1"
-    echo "$input" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\000-\011\013-\037'
+    # Fast path: check if the string contains any control characters or ESC (ASCII 1-31 or 127)
+    # If not, return the string immediately to avoid expensive sed/tr fork pipelines
+    if [[ "$input" != *[$'\001'-$'\037'$'\177']* ]]; then
+        echo "$input"
+        return
+    fi
+
+    # Slow path: only run when control characters/ANSI sequences are actually present
+    local esc=$'\033'
+    echo "$input" | sed "s/${esc}\[[0-9;]*[a-zA-Z]//g" | tr -d '\000-\011\013-\037'
 }
 
 s9_read_proc_file() {
@@ -518,7 +700,12 @@ s9_read_proc_file() {
 
 s9_validate_port() {
     local port="$1"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        s9_die "Invalid port number: $port (must be 1-65535)"
+    fi
+
+    local port_num=$((10#$port))
+    if (( port_num < 1 || port_num > 65535 )); then
         s9_die "Invalid port number: $port (must be 1-65535)"
     fi
 }
@@ -534,6 +721,12 @@ s9_validate_safe_dir() {
     fi
 
     [[ -z "$resolved" ]] && resolved="$dir"
+
+    # Fallback path traversal validation: reject paths containing '..' to prevent directory traversal
+    if [[ "$resolved" == *"/.."* || "$resolved" == "../"* || "$resolved" == ".." ]]; then
+        s9_warn "Path traversal attempt detected in snapshot directory: $dir"
+        return 1
+    fi
 
     local home_dir="${HOME:-}"
     local under_home=false
@@ -580,10 +773,10 @@ s9_resolve_pid() {
     fi
 
     local pids
-    pids=$(pgrep -x -- "$input" 2>/dev/null) || pids=$(pgrep -- "$input" 2>/dev/null) || true
+    pids=$(pgrep -x -- "$input" 2>/dev/null) || true
 
     if [[ -z "$pids" ]]; then
-        [[ "$quiet" != "true" ]] && s9_warn "No process found matching '$input'"
+        [[ "$quiet" != "true" ]] && s9_warn "No process found with exact name '$input'"
         return 1
     fi
 
@@ -641,11 +834,11 @@ s9_compare_row() {
     local percent="—"
 
     if (( val1 > 0 )); then
-        percent=$(echo "scale=1; ($diff * 100) / $val1" | s9_calc 2>/dev/null || echo "0")
-        if [[ "$percent" =~ ^\\. ]]; then
-            percent="0$percent"
-        elif [[ "$percent" =~ ^-\\. ]]; then
-            percent="-0${percent#-}"
+        local int_val=$(( (abs_diff * 100) / val1 ))
+        local dec_val=$(( ((abs_diff * 1000) / val1) % 10 ))
+        percent="${int_val}.${dec_val}"
+        if (( diff < 0 )); then
+            percent="-${percent}"
         fi
         percent="${percent}%"
     elif (( val2 > 0 )); then
@@ -714,6 +907,10 @@ s9_decode_signals() {
     local num
     mask="${mask#0x}"
     mask="${mask#0X}"
+    # Signal masks from /proc are 16 hex chars (64-bit). We only decode signals
+    # 1-31 (standard POSIX), which all fit in the low 32 bits (8 hex chars).
+    # Real-time signals (32-64) in the upper bits are intentionally not decoded
+    # since the S9_SIGNALS table only covers 1-31.
     [[ ${#mask} -gt 8 ]] && mask="${mask: -8}"
     num=$((16#$mask)) 2>/dev/null || num=0
 
@@ -731,15 +928,98 @@ s9_decode_signals() {
 #------------------------------------------------------------------------------
 
 s9_get_total_mem() {
-    awk '/^MemTotal:/ {print $2}' /proc/meminfo
+    # Check cgroup total memory limit
+    local limit=0
+    local cg_path
+    for cg_path in "/sys/fs/cgroup/memory.max" "/sys/fs/cgroup/memory/memory.limit_in_bytes"; do
+        if [[ -r "$cg_path" ]]; then
+            local val
+            val=$(head -n 1 "$cg_path" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$val" =~ ^[0-9]+$ ]] && (( val > 0 && val < 9000000000000000000 )); then
+                limit=$(( val / 1024 ))  # convert to KB
+                break
+            fi
+        fi
+    done
+
+    local host_mem=0
+    local key val
+    while read -r key val _; do
+        if [[ "$key" == "MemTotal:" ]]; then
+            host_mem="$val"
+            break
+        fi
+    done < /proc/meminfo
+
+    # If cgroup limit is active and less than host memory, return cgroup limit
+    if (( limit > 0 && limit < host_mem )); then
+        echo "$limit"
+    else
+        echo "${host_mem:-0}"
+    fi
 }
 
 s9_get_avail_mem() {
-    awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+    local limit=0
+    local usage=0
+    local cg_path
+    
+    # 1. Resolve cgroup limit
+    for cg_path in "/sys/fs/cgroup/memory.max" "/sys/fs/cgroup/memory/memory.limit_in_bytes"; do
+        if [[ -r "$cg_path" ]]; then
+            local val
+            val=$(head -n 1 "$cg_path" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$val" =~ ^[0-9]+$ ]] && (( val > 0 && val < 9000000000000000000 )); then
+                limit="$val"
+                break
+            fi
+        fi
+    done
+    
+    # 2. Resolve cgroup current usage
+    if (( limit > 0 )); then
+        for cg_path in "/sys/fs/cgroup/memory.current" "/sys/fs/cgroup/memory/memory.usage_in_bytes"; do
+            if [[ -r "$cg_path" ]]; then
+                local val
+                val=$(head -n 1 "$cg_path" 2>/dev/null | tr -d '[:space:]')
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    usage="$val"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    local cgroup_avail=0
+    if (( limit > 0 && usage >= 0 && limit > usage )); then
+        cgroup_avail=$(( (limit - usage) / 1024 ))  # convert to KB
+    fi
+
+    # 3. Resolve host MemAvailable
+    local host_avail=0
+    local key val
+    while read -r key val _; do
+        if [[ "$key" == "MemAvailable:" ]]; then
+            host_avail="$val"
+            break
+        fi
+    done < /proc/meminfo
+
+    # 4. If cgroup available memory is active and less than host available memory, return cgroup available memory
+    if (( cgroup_avail > 0 && cgroup_avail < host_avail )); then
+        echo "$cgroup_avail"
+    else
+        echo "${host_avail:-0}"
+    fi
 }
 
 s9_get_uptime() {
-    awk '{print int($1)}' /proc/uptime
+    local uptime_val
+    if read -r uptime_val _ < /proc/uptime; then
+        echo "${uptime_val%%.*}"
+    else
+        echo "0"
+    fi
 }
 
 s9_get_kernel() {

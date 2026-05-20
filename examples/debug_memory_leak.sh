@@ -26,9 +26,6 @@ if ! source "${SCRIPT_DIR}/../lib/s9-common.sh" 2>/dev/null; then
         S9_BOLD=$'\033[1m'
         S9_DIM=$'\033[2m'
         S9_NC=$'\033[0m'
-        
-        # Check bc dependency manually
-        command -v bc &>/dev/null || { echo "Error: bc is required"; exit 1; }
     fi
 fi
 
@@ -53,7 +50,8 @@ ${S9_BOLD}EXAMPLES:${S9_NC}
     $0 nginx              # Monitor nginx with defaults (1 hour, 1 min intervals)
 
 ${S9_BOLD}OUTPUT:${S9_NC}
-    Creates a CSV log file in /tmp with timestamp, RSS, VmSize, and FD count.
+    Creates a CSV log file in the system temp directory with timestamp, RSS,
+    VmSize, and FD count.
     At the end, provides analysis of memory growth.
 
 EOF
@@ -70,13 +68,26 @@ TARGET="$1"
 DURATION="${2:-3600}"  # Default: 1 hour
 INTERVAL="${3:-60}"    # Default: 1 minute
 
+if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || (( 10#$DURATION < 1 )); then
+    printf "%bError:%b duration must be a positive integer\n" "${S9_RED}" "${S9_NC}"
+    exit 1
+fi
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || (( 10#$INTERVAL < 1 )); then
+    printf "%bError:%b interval must be a positive integer\n" "${S9_RED}" "${S9_NC}"
+    exit 1
+fi
+DURATION=$((10#$DURATION))
+INTERVAL=$((10#$INTERVAL))
+
 # Resolve PID
-if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-    PID="$TARGET"
+if declare -F s9_resolve_pid >/dev/null 2>&1; then
+    PID=$(s9_resolve_pid "$TARGET") || exit 1
+elif [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+    PID="$((10#$TARGET))"
 else
-    PID=$(pgrep -n "$TARGET" 2>/dev/null || true)
+    PID=$(pgrep -n -x -- "$TARGET" 2>/dev/null || true)
     if [[ -z "$PID" ]]; then
-        printf "%bError:%b No process found matching '%s'\n" "${S9_RED}" "${S9_NC}" "$TARGET"
+        printf "%bError:%b No process found with exact name '%s'\n" "${S9_RED}" "${S9_NC}" "$TARGET"
         exit 1
     fi
 fi
@@ -90,7 +101,10 @@ fi
 PROC_NAME=$(cat "/proc/$PID/comm" 2>/dev/null || echo "unknown")
 
 # Create log file
-LOG_FILE="/tmp/substrata9_memleak_${PID}_$(date +%Y%m%d_%H%M%S).csv"
+TEMP_DIR="${TMPDIR:-/tmp}"
+TEMP_DIR="${TEMP_DIR%/}"
+[[ -n "$TEMP_DIR" ]] || TEMP_DIR="/tmp"
+LOG_FILE="${TEMP_DIR}/substrata9_memleak_${PID}_$(date +%Y%m%d_%H%M%S).csv"
 
 echo ""
 printf "%b╔════════════════════════════════════════════════════════════════════╗%b\n" "${S9_BOLD}" "${S9_NC}"
@@ -187,7 +201,7 @@ if [[ -n "${SNAPSHOT_CMD:-}" ]]; then
     
     echo ""
     printf "%bComparing snapshots:%b\n" "${S9_BOLD}" "${S9_NC}"
-    "$SNAPSHOT_CMD" diff "leak_start_$$" "leak_end_$$" 2>/dev/null || true
+    "$SNAPSHOT_CMD" diff "leak_start_$$" "leak_end_$$" --latest 2>/dev/null || true
 fi
 
 echo ""
@@ -214,6 +228,10 @@ elif (( SAMPLE_COUNT > 1 )); then
         
         FIRST_FDS=$(grep -v "^Timestamp," "$LOG_FILE" | head -1 | cut -d, -f5)
         LAST_FDS=$(grep -v "^Timestamp," "$LOG_FILE" | tail -1 | cut -d, -f5)
+        if ! [[ "$FIRST_FDS" =~ ^[0-9]+$ ]] || ! [[ "$LAST_FDS" =~ ^[0-9]+$ ]]; then
+            FIRST_FDS=0
+            LAST_FDS=0
+        fi
         FD_GROWTH=$((LAST_FDS - FIRST_FDS))
         
         echo "Memory:"
@@ -251,3 +269,9 @@ echo ""
 printf "%bTo visualize the data:%b\n" "${S9_DIM}" "${S9_NC}"
 echo "  column -t -s, $LOG_FILE | less"
 echo ""
+
+# Cleanup temporary snapshots
+if [[ -n "${SNAPSHOT_CMD:-}" ]]; then
+    "$SNAPSHOT_CMD" delete "leak_start_$$" --force --latest 2>/dev/null || true
+    "$SNAPSHOT_CMD" delete "leak_end_$$" --force --latest 2>/dev/null || true
+fi
